@@ -1,6 +1,6 @@
 #include <stdlib.h>
 #include <ctype.h>
-#include <chess_logic.h>
+#include "chess_logic.h"
 
 char board[8][8];
 int current_turn; //0 rand alb, 1 rand negru
@@ -36,7 +36,7 @@ static int in_bounds(int row, int col) {
 //initializam tabla
 void init_board(){
     // R = Turn, N = Cal, B = Nebun, Q = Regina, K = Rege
-    char s[8]="RNBQKBNR";
+    char s[9]="RNBQKBNR";
     for (int i=0 ; i<8 ; i++){
         board[0][i]=tolower(s[i]);
         board[1][i]='p';
@@ -79,10 +79,11 @@ static int is_sqare_attacked(int r, int c, int by_turn){
             
             char P = toupper(p);
             int dr = r - rr, dc = c - cc; // distanta in coordonate
+            int dir;
             
             switch (P) {
             case 'P': //pioni
-                int dir = (by_turn == 0) ? -1 : 1; // albul ataca in sus is negrul in jos
+                dir = (by_turn == 0) ? -1 : 1; // albul ataca in sus is negrul in jos
                 if (dr == dir && abs(dc) == 1) return 1;
                 break;
             case 'N': //cal
@@ -183,8 +184,8 @@ int pseudo_legal(int r1, int c1, int r2, int c2, int turn)
                 char expected_rook = (turn == 0) ? 'R' : 'r';
                 if (board[row][7] != expected_rook) return 0;
                 if (board[row][5] != EMPTY || board[row][6] != EMPTY) return 0; //spatiul dintre ele trebuie sa fie gol
-                if (is_square_attacked(row, 5, 1 - turn)) return 0; //regele nu poate trece prin sah
-                if (is_square_attacked(row, 6, 1 - turn)) return 0; //regele nu poate ajunge in sah
+                if (is_sqare_attacked(row, 5, 1 - turn)) return 0; //regele nu poate trece prin sah
+                if (is_sqare_attacked(row, 6, 1 - turn)) return 0; //regele nu poate ajunge in sah
                 return 1;
             }
             if (dc == -2) { //rocada mare pe partea reginei
@@ -193,8 +194,8 @@ int pseudo_legal(int r1, int c1, int r2, int c2, int turn)
                 char expected_rook = (turn == 0) ? 'R' : 'r';
                 if (board[row][0] != expected_rook) return 0;
                 if (board[row][1] != EMPTY || board[row][2] != EMPTY || board[row][3] != EMPTY) return 0;
-                if (is_square_attacked(row, 3, 1 - turn)) return 0;
-                if (is_square_attacked(row, 2, 1 - turn)) return 0;
+                if (is_sqare_attacked(row, 3, 1 - turn)) return 0;
+                if (is_sqare_attacked(row, 2, 1 - turn)) return 0;
                 return 1;
             }
         }
@@ -311,7 +312,7 @@ void execute_move(int r1, int c1, int r2, int c2, char promotion){
     //inregistreaza permanent miscarea regilor si turnurilor (anuleaza rocada pe viito)
     if(piece=='K') white_king_moved=1;
     if(piece=='k') black_king_moved=1;
-    if(piece=='r' || piece=="R"){
+    if(piece=='r' || piece=='R'){
         if(r1==7 && c1==0) white_rook_a_moved=1;
         if(r1==7 && c1==7) white_rook_h_moved=1;
         if(r1==0 && c1==0) black_rook_a_moved=1;
