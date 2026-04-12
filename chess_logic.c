@@ -330,3 +330,58 @@ void execute_move(int r1, int c1, int r2, int c2, char promotion){
         board[r2][c2] = (current_turn == 0) ? (char)toupper(promotion) : (char)tolower(promotion);
     }
 }
+
+//genereaza FEN-ul pozitiei curente
+#include <stdio.h>
+void board_to_fen(char *fen, int max_len){
+    int idx = 0;
+
+    //1. pozitia pieselor
+    for (int r = 0; r < 8; r++){
+        int empty = 0;
+        for (int c = 0; c < 8; c++){
+            if (board[r][c] == EMPTY){
+                empty++;
+            } else {
+                if (empty > 0){ fen[idx++] = '0' + empty; empty = 0; }
+                fen[idx++] = board[r][c];
+            }
+        }
+        if (empty > 0) fen[idx++] = '0' + empty;
+        if (r < 7) fen[idx++] = '/';
+    }
+
+    //2. culoarea activa
+    fen[idx++] = ' ';
+    fen[idx++] = (current_turn == 0) ? 'w' : 'b';
+
+    //3. drepturi de rocada
+    fen[idx++] = ' ';
+    int ci = idx;
+    if (!white_king_moved){
+        if (!white_rook_h_moved) fen[idx++] = 'K';
+        if (!white_rook_a_moved) fen[idx++] = 'Q';
+    }
+    if (!black_king_moved){
+        if (!black_rook_h_moved) fen[idx++] = 'k';
+        if (!black_rook_a_moved) fen[idx++] = 'q';
+    }
+    if (idx == ci) fen[idx++] = '-';
+
+    //4. en passant
+    fen[idx++] = ' ';
+    if (ep_target_row >= 0 && ep_target_col >= 0){
+        fen[idx++] = (char)('a' + ep_target_col);
+        fen[idx++] = (char)('0' + (8 - ep_target_row));
+    } else {
+        fen[idx++] = '-';
+    }
+
+    //5. halfmove si fullmove (simplificat)
+    fen[idx++] = ' ';
+    fen[idx++] = '0';
+    fen[idx++] = ' ';
+    fen[idx++] = '1';
+    fen[idx++] = '\0';
+    (void)max_len;
+}

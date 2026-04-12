@@ -24,4 +24,7 @@ int has_legal_moves(int turn);
 //promotion piece e 0 in cazul in care nu e necesar, altfel se inlocuieste cu piesa la input
 void execute_move(int r1, int c1, int r2, int c2, char promotion_piece);
 
+//genereaza FEN-ul pozitiei curente (pentru comunicare cu engine-ul)
+void board_to_fen(char *fen, int max_len);
+
 #endif
