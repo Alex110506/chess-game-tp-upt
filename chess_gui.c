@@ -8,6 +8,7 @@
 #include "raylib.h"
 #include "chess_logic.h"
 #include "chess_gui.h"
+#include "chess_net.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -45,7 +46,15 @@
 #define C_BLACK_P (Color){  30,  30,  30, 255 }
 
 //popupuri
-typedef enum { ST_SELECT, ST_PROMOTE, ST_GAMEOVER, ST_BOT_THINKING, ST_BOT_READY, ST_HINT_THINKING } GameSt;
+typedef enum {
+    ST_SELECT,
+    ST_PROMOTE,
+    ST_GAMEOVER,
+    ST_BOT_THINKING,
+    ST_BOT_READY,
+    ST_HINT_THINKING,
+    ST_WAIT_OPP        // multiplayer: asteptam mutarea oponentului
+} GameSt;
 
 Screen curScreen = SCR_HOME;
 static GameSt gameSt = ST_SELECT;
@@ -86,6 +95,15 @@ static int pStreak = 0;
 static bool statsLoaded = false;
 static const char *STATS_FILE = "chess_stats.txt";
 
+// stare multiplayer
+static int  mpMode = 0;            // 1 = joc online prin server
+static int  mpMyColor = 0;         // 0 = alb, 1 = negru (coloarea pe care o jucam)
+static char mpRoomCode[8] = "";    // codul camerei curente (afisat pe ecran)
+static char mpJoinInput[8] = "";   // bufferul de input pentru codul de join
+static char mpStatus[160] = "";    // mesaj informativ afisat in UI (erori, info)
+static bool mpHosting = false;     // 1 daca tocmai am cerut create si asteptam codul
+static bool mpOpponentLeft = false;
+
 // incarca statisticile din fisier
 static void load_stats(void) {
     if (statsLoaded) return;
@@ -124,6 +142,87 @@ static void set_game_over(void) {
         }
         save_stats();
     }
+}
+
+// ─── helper-i multiplayer ────────────────────────────────────────────────
+
+// transforma coordonatele tablei + caracter de promovare in notatie UCI
+// (ex: r1=6,c1=4,r2=4,c2=4 -> "e2e4"; cu promo='Q' -> "e7e8q")
+static void coords_to_uci(int r1, int c1, int r2, int c2, char promo, char out[8])
+{
+    out[0] = (char)('a' + c1);
+    out[1] = (char)('0' + (8 - r1));
+    out[2] = (char)('a' + c2);
+    out[3] = (char)('0' + (8 - r2));
+    if (promo) {
+        out[4] = (char)tolower((unsigned char)promo);
+        out[5] = '\0';
+    } else {
+        out[4] = '\0';
+    }
+}
+
+// reseteaza starea de multiplayer si tabla
+static void mp_reset_state(void)
+{
+    mpMode = 0;
+    mpMyColor = 0;
+    mpRoomCode[0] = '\0';
+    mpJoinInput[0] = '\0';
+    mpStatus[0] = '\0';
+    mpHosting = false;
+    mpOpponentLeft = false;
+}
+
+// inchide bridge-ul de retea (apelat la iesire si la parasirea jocului online)
+void mp_cleanup(void)
+{
+    if (net_running()) {
+        net_stop();
+    }
+    mp_reset_state();
+}
+
+// aplica pe tabla o mutare primita prin retea, in format UCI
+// returneaza 1 daca a fost aplicata cu succes
+static int mp_apply_remote_move(const char *uci)
+{
+    if (!uci || strlen(uci) < 4) return 0;
+    int c1 = uci[0] - 'a';
+    int r1 = 8 - (uci[1] - '0');
+    int c2 = uci[2] - 'a';
+    int r2 = 8 - (uci[3] - '0');
+    if (c1 < 0 || c1 > 7 || r1 < 0 || r1 > 7 ||
+        c2 < 0 || c2 > 7 || r2 < 0 || r2 > 7) return 0;
+
+    // verifica ca mutarea respecta regulile (apararea de baza)
+    if (!pseudo_legal(r1, c1, r2, c2, current_turn)) return 0;
+    if (!try_move_legal(r1, c1, r2, c2, current_turn)) return 0;
+
+    char promo = 'Q';
+    if (uci[4] != '\0') {
+        promo = (current_turn == 0)
+            ? (char)toupper((unsigned char)uci[4])
+            : uci[4];
+    }
+    execute_move(r1, c1, r2, c2, promo);
+    current_turn = 1 - current_turn;
+    return 1;
+}
+
+// porneste un joc online (din lobby cand vine 'start'). reseteaza tabla.
+static void mp_begin_game(void)
+{
+    init_board();
+    current_turn = 0;
+    selRow = selCol = -1;
+    hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+    botMode = 0;
+    mpMode = 1;  // activeaza modul multiplayer
+    mpOpponentLeft = false;
+    // gazda (alb) muta primul; daca eu sunt alb, sunt la rand
+    gameSt = (mpMyColor == current_turn) ? ST_SELECT : ST_WAIT_OPP;
+    curScreen = SCR_GAME;
 }
 
 static int sf_start(void)
@@ -407,6 +506,13 @@ void DrawHome(void)
     if (Btn(b3, "Play Against Bot", false)) {
         curScreen = SCR_BOTSETUP;
     }
+
+    // multiplayer online (host / join cu cod camera)
+    Rectangle b4 = { bx, 370, bw, bh };
+    if (Btn(b4, "Multiplayer (Online)", false)) {
+        mp_reset_state();
+        curScreen = SCR_MPSETUP;
+    }
 }
 
 //ecranul de selectare a dificultatii botului
@@ -506,6 +612,199 @@ void DrawBotSetup(void)
     }
 }
 
+// helper: deseneaza fundalul "scaler" al meniurilor
+static void draw_menu_bg(void)
+{
+    ClearBackground(C_BG);
+    int tw = WIN_W / 12, th = WIN_H / 10;
+    for (int rr = 0; rr < 10; rr++)
+        for (int cc = 0; cc < 12; cc++) {
+            unsigned char v = (rr + cc) % 2 == 0 ? 30 : 24;
+            DrawRectangle(cc * tw, rr * th, tw + 1, th + 1, (Color){v, v, v, 255});
+        }
+}
+
+// drenarea oricaror mesaje aparute pe bridge in timpul ecranelor de meniu
+static void mp_drain_menu_messages(void)
+{
+    NetMsg m;
+    while (net_running() && net_poll(&m)) {
+        if (m.type == NM_CREATED) {
+            strncpy(mpRoomCode, m.code, sizeof(mpRoomCode) - 1);
+            mpRoomCode[sizeof(mpRoomCode) - 1] = '\0';
+            mpMyColor = 0; // gazda joaca cu albul
+            mpHosting = false;
+            mpStatus[0] = '\0';
+            curScreen = SCR_MPLOBBY;
+        } else if (m.type == NM_JOINED) {
+            strncpy(mpRoomCode, m.code, sizeof(mpRoomCode) - 1);
+            mpRoomCode[sizeof(mpRoomCode) - 1] = '\0';
+            mpMyColor = 1; // invitatul joaca cu negrul
+            mpStatus[0] = '\0';
+            // jocul incepe la primirea mesajului 'start'
+        } else if (m.type == NM_START) {
+            mp_begin_game();
+        } else if (m.type == NM_ERROR) {
+            snprintf(mpStatus, sizeof(mpStatus), "Error: %s", m.msg);
+        } else if (m.type == NM_OPP_LEFT || m.type == NM_CLOSED) {
+            snprintf(mpStatus, sizeof(mpStatus), "Disconnected from server");
+            net_stop();
+        }
+    }
+}
+
+// ecranul Host/Join pentru multiplayer
+void DrawMpSetup(void)
+{
+    draw_menu_bg();
+    Vector2 mouse = GetMousePosition();
+
+    const char *title = "ONLINE MULTIPLAYER";
+    int titleSize = 56;
+    Vector2 tv = MeasureTextEx(gFont, title, titleSize, 2);
+    DrawTextEx(gFont, title, (Vector2){ (WIN_W - tv.x) * 0.5f, 60.0f }, titleSize, 2, WHITE);
+
+    const char *sub = "Host a game or join with a room code";
+    Vector2 sv = MeasureTextEx(gFont, sub, 20, 1);
+    DrawTextEx(gFont, sub, (Vector2){ (WIN_W - sv.x) * 0.5f, 145.0f }, 20, 1, LIGHTGRAY);
+
+    // pompeaza mesajele asincrone de la bridge
+    mp_drain_menu_messages();
+
+    float bw = 380.0f, bh = 58.0f, bx = (WIN_W - bw) * 0.5f;
+
+    // HOST
+    Rectangle bHost = { bx, 200, bw, bh };
+    bool hosting = mpHosting;  // dezactivat in timp ce asteptam codul
+    if (Btn(bHost, hosting ? "Connecting..." : "Host New Game", hosting)) {
+        if (!net_running()) {
+            if (!net_start(NULL)) {
+                snprintf(mpStatus, sizeof(mpStatus), "Could not start network bridge");
+            }
+        }
+        if (net_running()) {
+            mpHosting = true;
+            net_send_create();
+            mpStatus[0] = '\0';
+        }
+    }
+
+    // sectiunea JOIN
+    const char *jHdr = "Join an existing room:";
+    Vector2 jhv = MeasureTextEx(gFont, jHdr, 20, 1);
+    DrawTextEx(gFont, jHdr, (Vector2){ (WIN_W - jhv.x) * 0.5f, 290.0f }, 20, 1, LIGHTGRAY);
+
+    // input pentru codul camerei (4 caractere)
+    Rectangle inputR = { bx, 320, bw, bh };
+    bool inputHov = CheckCollisionPointRec(mouse, inputR);
+    DrawRectangleRounded(inputR, 0.18f, 8, (Color){ 35, 35, 35, 255 });
+    DrawRectangleRoundedLines(inputR, 0.18f, 8, inputHov ? LIME : DARKGRAY);
+
+    // text afisat in input (cu padding) sau placeholder
+    const char *placeholder = "Type room code (e.g. ABCD)";
+    const char *display = (mpJoinInput[0] != '\0') ? mpJoinInput : placeholder;
+    Color tc = (mpJoinInput[0] != '\0') ? WHITE : GRAY;
+    Vector2 dv = MeasureTextEx(gFont, display, 28, 2);
+    DrawTextEx(gFont, display,
+               (Vector2){ inputR.x + (inputR.width - dv.x) * 0.5f,
+                          inputR.y + (inputR.height - dv.y) * 0.5f },
+               28, 2, tc);
+
+    // input din tastatura: alfanumeric, max 4 chars (uppercase)
+    int ch = GetCharPressed();
+    while (ch > 0) {
+        int len = (int)strlen(mpJoinInput);
+        if (len < 4 && isalnum(ch)) {
+            mpJoinInput[len]   = (char)toupper(ch);
+            mpJoinInput[len+1] = '\0';
+        }
+        ch = GetCharPressed();
+    }
+    if (IsKeyPressed(KEY_BACKSPACE)) {
+        int len = (int)strlen(mpJoinInput);
+        if (len > 0) mpJoinInput[len-1] = '\0';
+    }
+
+    // butonul Join (activ doar cand avem 4 caractere)
+    bool joinReady = (strlen(mpJoinInput) == 4);
+    Rectangle bJoin = { bx, 395, bw, bh };
+    if (Btn(bJoin, "Join Room", !joinReady)) {
+        if (!net_running()) {
+            if (!net_start(NULL)) {
+                snprintf(mpStatus, sizeof(mpStatus), "Could not start network bridge");
+            }
+        }
+        if (net_running()) {
+            net_send_join(mpJoinInput);
+            mpStatus[0] = '\0';
+        }
+    }
+
+    // Enter face Join daca codul e complet
+    if (joinReady && IsKeyPressed(KEY_ENTER)) {
+        if (!net_running()) net_start(NULL);
+        if (net_running()) {
+            net_send_join(mpJoinInput);
+            mpStatus[0] = '\0';
+        }
+    }
+
+    // mesajul de stare (erori sau info)
+    if (mpStatus[0] != '\0') {
+        Vector2 mv = MeasureTextEx(gFont, mpStatus, 18, 1);
+        DrawTextEx(gFont, mpStatus, (Vector2){ (WIN_W - mv.x) * 0.5f, 475.0f }, 18, 1, GOLD);
+    }
+
+    // Back
+    Rectangle bBack = { bx, 540, bw, bh };
+    if (Btn(bBack, "Back", false)) {
+        mp_cleanup();
+        curScreen = SCR_HOME;
+    }
+}
+
+// ecranul de asteptare (gazda asteapta ca cineva sa se alature)
+void DrawMpLobby(void)
+{
+    draw_menu_bg();
+
+    const char *title = "WAITING FOR OPPONENT";
+    int titleSize = 50;
+    Vector2 tv = MeasureTextEx(gFont, title, titleSize, 2);
+    DrawTextEx(gFont, title, (Vector2){ (WIN_W - tv.x) * 0.5f, 80.0f }, titleSize, 2, WHITE);
+
+    const char *sub = "Share this code with your opponent:";
+    Vector2 sv = MeasureTextEx(gFont, sub, 22, 1);
+    DrawTextEx(gFont, sub, (Vector2){ (WIN_W - sv.x) * 0.5f, 175.0f }, 22, 1, LIGHTGRAY);
+
+    // afiseaza codul mare si centrat
+    Vector2 cv = MeasureTextEx(gFont, mpRoomCode, 110, 6);
+    DrawTextEx(gFont, mpRoomCode,
+               (Vector2){ (WIN_W - cv.x) * 0.5f, 230.0f }, 110, 6, GOLD);
+
+    // animatie cu puncte
+    int dots = ((int)(GetTime() * 3.0)) % 4;
+    char waitTxt[32];
+    snprintf(waitTxt, sizeof(waitTxt), "Waiting%.*s", dots, "...");
+    Vector2 wv = MeasureTextEx(gFont, waitTxt, 24, 1);
+    DrawTextEx(gFont, waitTxt, (Vector2){ (WIN_W - wv.x) * 0.5f, 380.0f }, 24, 1, LIGHTGRAY);
+
+    // pompeaza mesajele asincrone (cand vine 'start' incepe jocul)
+    mp_drain_menu_messages();
+
+    if (mpStatus[0] != '\0') {
+        Vector2 mv = MeasureTextEx(gFont, mpStatus, 18, 1);
+        DrawTextEx(gFont, mpStatus, (Vector2){ (WIN_W - mv.x) * 0.5f, 440.0f }, 18, 1, RED);
+    }
+
+    float bw = 380.0f, bh = 58.0f, bx = (WIN_W - bw) * 0.5f;
+    Rectangle bCancel = { bx, 540, bw, bh };
+    if (Btn(bCancel, "Cancel", false)) {
+        mp_cleanup();
+        curScreen = SCR_HOME;
+    }
+}
+
 //ecran de joc
 void DrawGame(void)
 {
@@ -534,6 +833,37 @@ void DrawGame(void)
         hintDstCol = sf_bestmove[2] - 'a';
         hintDstRow = 8 - (sf_bestmove[3] - '0');
         gameSt = ST_SELECT;
+    }
+
+    /* ── multiplayer: polling pentru mutari sau evenimente ── */
+    if (mpMode) {
+        NetMsg nm;
+        while (net_poll(&nm)) {
+            if (nm.type == NM_MOVE) {
+                if (mp_apply_remote_move(nm.uci)) {
+                    selRow = selCol = -1;
+                    hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+                    if (!has_legal_moves(current_turn)) {
+                        set_game_over();
+                    } else {
+                        gameSt = ST_SELECT;  // acum e randul nostru
+                    }
+                }
+            } else if (nm.type == NM_OPP_LEFT) {
+                mpOpponentLeft = true;
+                snprintf(mpStatus, sizeof(mpStatus), "Opponent disconnected");
+                gameSt = ST_GAMEOVER;
+            } else if (nm.type == NM_RESIGN) {
+                snprintf(mpStatus, sizeof(mpStatus), "Opponent resigned");
+                gameSt = ST_GAMEOVER;
+            } else if (nm.type == NM_ERROR) {
+                snprintf(mpStatus, sizeof(mpStatus), "Network: %s", nm.msg);
+            } else if (nm.type == NM_CLOSED) {
+                mpOpponentLeft = true;
+                snprintf(mpStatus, sizeof(mpStatus), "Disconnected from server");
+                gameSt = ST_GAMEOVER;
+            }
+        }
     }
 
     //calculeaza starea de sah
@@ -618,6 +948,8 @@ void DrawGame(void)
     const char *who;
     if (botMode)
         who = (current_turn == 0) ? "You (White)" : "Bot (Black)";
+    else if (mpMode)
+        who = (current_turn == mpMyColor) ? "Your turn" : "Opponent's turn";
     else
         who = (current_turn == 0) ? "White" : "Black";
     Color swFill = (current_turn == 0) ? WHITE : (Color){ 30, 30, 30, 255};
@@ -651,6 +983,16 @@ void DrawGame(void)
         py += 32.0f;
     }
 
+    // in modul multiplayer, afiseaza un mesaj cand asteptam mutarea oponentului
+    if (gameSt == ST_WAIT_OPP) {
+        int dots = ((int)(GetTime() * 3.0)) % 4;
+        char waitTxt[32];
+        snprintf(waitTxt, sizeof(waitTxt), "Waiting%.*s", dots, "...");
+        Vector2 wv = MeasureTextEx(gFont, waitTxt, 22, 1);
+        DrawTextEx(gFont, waitTxt, (Vector2){ px + (PANEL_W - wv.x) * 0.5f - 5.0f, py }, 22, 1, GOLD);
+        py += 32.0f;
+    }
+
     //info dificultate in bot mode
     if (botMode && gameSt != ST_GAMEOVER) {
         const char *diffTxt = (botDepth <= 1) ? "Easy" : (botDepth <= 5) ? "Medium" : "Hard";
@@ -660,27 +1002,55 @@ void DrawGame(void)
         DrawTextEx(gFont, diffLabel, (Vector2){ px + (PANEL_W - dv.x) * 0.5f - 5.0f, py }, 16, 1, LIGHTGRAY);
     }
 
+    // mesaj de stare multiplayer (erori de retea, etc.)
+    if (mpMode && mpStatus[0] != '\0') {
+        Vector2 mv = MeasureTextEx(gFont, mpStatus, 14, 1);
+        DrawTextEx(gFont, mpStatus, (Vector2){ px + (PANEL_W - mv.x) * 0.5f - 5.0f, py }, 14, 1, GOLD);
+        py += 22.0f;
+    }
+
     // butoanele panoului
     float btnY = (float)(PANEL_Y + PANEL_H - 170);
     Rectangle rHint = { (float)PANEL_X, btnY, (float)(PANEL_W - 20), 45 };
     Rectangle rNew = { (float)PANEL_X, btnY + 57.0f, (float)(PANEL_W - 20), 45 };
     Rectangle rMenu = { (float)PANEL_X, btnY + 114.0f,(float)(PANEL_W - 20), 45 };
 
-    if (Btn(rHint, "Suggest Move", gameSt != ST_SELECT)) {
-        if (sf_pid <= 0) sf_start();
-        if (sf_pid > 0) {
-            gameSt = ST_HINT_THINKING;
-            sf_request_move();
+    if (mpMode) {
+        // in multiplayer: primul buton = Resign (in loc de Suggest Move)
+        bool canResign = (gameSt == ST_SELECT || gameSt == ST_WAIT_OPP);
+        if (Btn(rHint, "Resign", !canResign)) {
+            net_send_resign();
+            snprintf(mpStatus, sizeof(mpStatus), "You resigned");
+            gameSt = ST_GAMEOVER;
+        }
+    } else {
+        // in modul local/bot: butonul de hint
+        if (Btn(rHint, "Suggest Move", gameSt != ST_SELECT)) {
+            if (sf_pid <= 0) sf_start();
+            if (sf_pid > 0) {
+                gameSt = ST_HINT_THINKING;
+                sf_request_move();
+            }
         }
     }
-    if (Btn(rNew,  "New Game",  false)) {
-        init_board();
-        current_turn = 0;
-        selRow = selCol = -1;
-        hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
-        gameSt = ST_SELECT;
+
+    if (mpMode) {
+        // in multiplayer: "New Game" nu are sens, il dezactivam
+        Btn(rNew, "New Game", true);
+    } else {
+        if (Btn(rNew,  "New Game",  false)) {
+            init_board();
+            current_turn = 0;
+            selRow = selCol = -1;
+            hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+            gameSt = ST_SELECT;
+        }
     }
+
     if (Btn(rMenu, "Main Menu", false)) {
+        if (mpMode) {
+            mp_cleanup();  // inchide conexiunea de retea
+        }
         curScreen = SCR_HOME;
         selRow = selCol = -1;
         hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
@@ -723,11 +1093,22 @@ void DrawGame(void)
             if (hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
                 char promChar = (current_turn == 0) ? pKeys[i][0] : (char)tolower((unsigned char)pKeys[i][0]);
                 execute_move(promSrcRow, promSrcCol, promDstRow, promDstCol, promChar);
+
+                // trimite mutarea prin retea daca suntem in modul multiplayer
+                if (mpMode) {
+                    char uci[8];
+                    coords_to_uci(promSrcRow, promSrcCol, promDstRow, promDstCol, pKeys[i][0], uci);
+                    net_send_move(uci);
+                }
+
                 current_turn = 1 - current_turn;
                 selRow = selCol = -1;
 
                 if (!has_legal_moves(current_turn)) {
                     set_game_over();
+                } else if (mpMode) {
+                    // dupa promovare in multiplayer, asteptam mutarea oponentului
+                    gameSt = ST_WAIT_OPP;
                 } else if (botMode && current_turn == 1) {
                     // dupa promovarea jucatorului, botul muta
                     gameSt = ST_BOT_THINKING;
@@ -750,15 +1131,25 @@ void DrawGame(void)
         DrawRectangleRoundedLines((Rectangle){ dx, dy, dw, dh }, 0.15f, 8, WHITE);
 
         bool mate = is_in_check(current_turn);
-        const char *hdr = mate ? "CHECKMATE" : "STALEMATE";
+        const char *hdr;
         const char *sub2;
-        if (mate) {
-            if (botMode)
-                sub2 = (current_turn == 0) ? "Bot wins!" : "You win!";
-            else
-                sub2 = (current_turn == 0) ? "Black wins!" : "White wins!";
+
+        if (mpMode && (mpOpponentLeft || mpStatus[0] != '\0')) {
+            // jocul s-a terminat din cauza deconectarii sau resign
+            hdr = "GAME OVER";
+            sub2 = mpStatus;
         } else {
-            sub2 = "Draw \xe2\x80\x94 no legal moves";
+            hdr = mate ? "CHECKMATE" : "STALEMATE";
+            if (mate) {
+                if (botMode)
+                    sub2 = (current_turn == 0) ? "Bot wins!" : "You win!";
+                else if (mpMode)
+                    sub2 = (current_turn == mpMyColor) ? "You lose!" : "You win!";
+                else
+                    sub2 = (current_turn == 0) ? "Black wins!" : "White wins!";
+            } else {
+                sub2 = "Draw \xe2\x80\x94 no legal moves";
+            }
         }
 
         Vector2 hv = MeasureTextEx(gFont, hdr, 52, 2);
@@ -767,13 +1158,25 @@ void DrawGame(void)
         Vector2 sv2 = MeasureTextEx(gFont, sub2, 26, 1);
         DrawTextEx(gFont, sub2, (Vector2){ dx + (dw - sv2.x) * 0.5f, dy + 92 }, 26, 1, GOLD);
 
-        Rectangle btnPA = { dx + (dw - 200) * 0.5f, dy + dh - 65, 200, 44 };
-        if (Btn(btnPA, "Play Again", false)) {
-            init_board();
-            current_turn = 0;
-            selRow = selCol = -1;
-            hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
-            gameSt = ST_SELECT;
+        if (mpMode) {
+            // in multiplayer: butonul duce inapoi la meniul principal
+            Rectangle btnPA = { dx + (dw - 200) * 0.5f, dy + dh - 65, 200, 44 };
+            if (Btn(btnPA, "Back to Menu", false)) {
+                mp_cleanup();
+                curScreen = SCR_HOME;
+                selRow = selCol = -1;
+                hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+                gameSt = ST_SELECT;
+            }
+        } else {
+            Rectangle btnPA = { dx + (dw - 200) * 0.5f, dy + dh - 65, 200, 44 };
+            if (Btn(btnPA, "Play Again", false)) {
+                init_board();
+                current_turn = 0;
+                selRow = selCol = -1;
+                hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+                gameSt = ST_SELECT;
+            }
         }
     }
 
@@ -782,8 +1185,11 @@ void DrawGame(void)
         hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1; // sterge vizualizarea hint-ului la orice click
 
         // previne mutarile facute de om atunci cand este randul botului (negru)
+        // in multiplayer, previne mutarile cand nu este randul nostru
         if (botMode && current_turn == 1) {
             // masura de precautie: click-urile sunt ignorate in acest moment
+        } else if (mpMode && mpMyColor != current_turn) {
+            // nu este randul nostru in multiplayer, ignoram click-urile
         } else {
             int cr, cc; // rand curent (current row) si coloana curenta (current column) deduse din click
             if (PixToBoard(mouse, &cr, &cc)) {
@@ -812,14 +1218,28 @@ void DrawGame(void)
                         selRow = selCol = -1;   // sterge vizual patratul selectat pentru a nu se suprapune cu meniul
                         gameSt = ST_PROMOTE;
                     } else {
+                        // salvam coordonatele inainte de a deselecta (pentru trimiterea prin retea)
+                        int srcR = selRow, srcC = selCol;
+
                         // mutare normala
                         execute_move(selRow, selCol, cr, cc, 'Q');  // 'Q' e transmis ca placeholder ignorat
+
+                        // trimite mutarea prin retea daca suntem in modul multiplayer
+                        if (mpMode) {
+                            char uci[8];
+                            coords_to_uci(srcR, srcC, cr, cc, 0, uci);
+                            net_send_move(uci);
+                        }
+
                         current_turn = 1 - current_turn; // schimba randul jucatorului
                         selRow = selCol = -1; // deselecteaza
 
                         // verifica daca dupa aceasta mutare jocul s-a terminat
                         if (!has_legal_moves(current_turn)) {
                             set_game_over();
+                        } else if (mpMode) {
+                            // dupa mutare in multiplayer, asteptam mutarea oponentului
+                            gameSt = ST_WAIT_OPP;
                         } else if (botMode && current_turn == 1) {
                             // daca jocul continua si e modul vs bot, incepem sa cerem mutarea botului
                             gameSt = ST_BOT_THINKING;

@@ -17,18 +17,24 @@ int main(void)
         BeginDrawing();
         
         // afiseaza ecranul corespunzator starii curente
-        if (curScreen == SCR_HOME)          
+        if (curScreen == SCR_HOME)
             DrawHome();
-        else if (curScreen == SCR_BOTSETUP) 
+        else if (curScreen == SCR_BOTSETUP)
             DrawBotSetup();
-        else                                
+        else if (curScreen == SCR_MPSETUP)
+            DrawMpSetup();
+        else if (curScreen == SCR_MPLOBBY)
+            DrawMpLobby();
+        else
             DrawGame();
-            
+
         EndDrawing();
     }
 
     // oprim procesul Stockfish (daca a fost pornit) pentru a evita procese ramase in fundal
     sf_stop();
+    // oprim procesul bridge de multiplayer (daca exista)
+    mp_cleanup();
     // eliberam memoria ocupata de fonturi
     cleanup_fonts();
     // inchidem fereastra raylib si eliberam resursele

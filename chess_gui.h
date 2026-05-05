@@ -8,7 +8,13 @@
 #define WIN_H 680
 
 // starea ecranului curent din joc
-typedef enum { SCR_HOME, SCR_BOTSETUP, SCR_GAME } Screen;
+typedef enum {
+    SCR_HOME,
+    SCR_BOTSETUP,
+    SCR_MPSETUP,    // alegerea intre host si join pentru multiplayer
+    SCR_MPLOBBY,    // gazda asteapta un oponent (afiseaza codul camerei)
+    SCR_GAME
+} Screen;
 
 // variabila globala care retine pe ce ecran ne aflam
 extern Screen curScreen;
@@ -20,9 +26,14 @@ void cleanup_fonts(void);
 // functii principale de desenare pentru fiecare ecran
 void DrawHome(void);
 void DrawBotSetup(void);
+void DrawMpSetup(void);
+void DrawMpLobby(void);
 void DrawGame(void);
 
 // opreste procesul motorului de sah (Stockfish) in caz de iesire
 void sf_stop(void);
+
+// opreste procesul de retea pentru multiplayer in caz de iesire
+void mp_cleanup(void);
 
 #endif // CHESS_GUI_H
