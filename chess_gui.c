@@ -7,6 +7,7 @@
 
 #include "raylib.h"
 #include "chess_logic.h"
+#include "chess_gui.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -16,10 +17,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
-
-//layout
-#define WIN_W 960
-#define WIN_H 680
+#include <sys/wait.h>
 
 #define BOARD_X 60 //spatiu pt lables
 #define BOARD_Y 40 //spatiu pt lables
@@ -46,51 +44,111 @@
 #define C_WHITE_P (Color){ 245, 240, 220, 255 }
 #define C_BLACK_P (Color){  30,  30,  30, 255 }
 
-//state
-typedef enum { SCR_HOME, SCR_BOTSETUP, SCR_GAME } Screen;
 //popupuri
-typedef enum { ST_SELECT, ST_PROMOTE, ST_GAMEOVER, ST_BOT_THINKING, ST_BOT_READY } GameSt;
+typedef enum { ST_SELECT, ST_PROMOTE, ST_GAMEOVER, ST_BOT_THINKING, ST_BOT_READY, ST_HINT_THINKING } GameSt;
 
-static Screen curScreen = SCR_HOME;
+Screen curScreen = SCR_HOME;
 static GameSt gameSt = ST_SELECT;
-static double botMoveReadyTime = 0.0;  // time when bot move was received
+static double botMoveReadyTime = 0.0;  // momentul (timpul) cand mutarea botului a fost calculata
 
-//patrat selectat
+// variabile pentru patratul selectat de jucator si patratele folosite pentru 'hint'
 static int selRow = -1, selCol = -1;
+static int hintSrcRow = -1, hintSrcCol = -1, hintDstRow = -1, hintDstCol = -1;
 
-//tine minte ce miscare a facut promovarea
+// retine date despre pozitia pionului inainte si dupa promovare
 static int promSrcRow, promSrcCol, promDstRow, promDstCol;
 
-//cache pentru a tine minte miscari legale
+// matrice folosita ca un cache pentru a tine minte mutarile legale ale piesei selectate
 static int legal[8][8];
 
 static Font gFont;
-static bool gFontHasChess = false;   /* adevarat daca fontul suporta simbolurile ♔..♟ */
+static bool gFontHasChess = false;   /* adevarat daca fontul suporta simbolurile de sah Unicode ♔..♟ */
 
-//bot / stockfish
-static int botMode = 0;       // 1 = joc contra bot (botul e negru)
-static int botDepth = 5;      // adancimea de cautare stockfish
+// setari si variabile pentru integrarea motorului Stockfish
+static int botMode = 0;       // 1 = joc contra bot (botul joaca mereu cu piesele negre)
+static int botDepth = 5;      // adancimea de calcul pentru Stockfish (afecteaza dificultatea)
 
-static pid_t sf_pid = -1;
-static int sf_write_fd = -1;  // pipe catre stdin-ul stockfish
-static int sf_read_fd = -1;   // pipe din stdout-ul stockfish
+static pid_t sf_pid = -1;     // PID-ul procesului Stockfish
+static int sf_write_fd = -1;  // file descriptor pentru a trimite comenzi catre Stockfish
+static int sf_read_fd = -1;   // file descriptor pentru a citi raspunsurile de la Stockfish
 
-static char sf_buf[16384];
+static char sf_buf[16384];    // buffer pentru citirea datelor
 static int sf_buf_len = 0;
-static char sf_bestmove[8];
+static char sf_bestmove[8];   // sir de caractere pentru a salva cea mai buna mutare (ex: "e2e4")
 
-// calea catre engine relativ la executabil
+// calea catre executabilul motorului de sah
 #define SF_PATH "./stockfish/src/stockfish"
+
+// statistici pentru jucator (salvate local)
+static int pWins = 0;
+static int pLosses = 0;
+static int pStreak = 0;
+static bool statsLoaded = false;
+static const char *STATS_FILE = "chess_stats.txt";
+
+// incarca statisticile din fisier
+static void load_stats(void) {
+    if (statsLoaded) return;
+    FILE *f = fopen(STATS_FILE, "r");
+    if (f) {
+        fscanf(f, "%d %d %d", &pWins, &pLosses, &pStreak);
+        fclose(f);
+    }
+    statsLoaded = true;
+}
+
+// salveaza statisticile curente inapoi in fisier
+static void save_stats(void) {
+    FILE *f = fopen(STATS_FILE, "w");
+    if (f) {
+        fprintf(f, "%d %d %d\n", pWins, pLosses, pStreak);
+        fclose(f);
+    }
+}
+
+// functie care marcheaza finalul de joc si actualizeaza statisticile (doar vs bot)
+static void set_game_over(void) {
+    gameSt = ST_GAMEOVER;
+    if (botMode) {
+        bool mate = is_in_check(current_turn);
+        if (mate) {
+            if (current_turn == 0) {
+                pLosses++;
+                pStreak = 0;
+            } else {
+                pWins++;
+                pStreak++;
+            }
+        } else {
+            pStreak = 0;
+        }
+        save_stats();
+    }
+}
 
 static int sf_start(void)
 {
     if (sf_pid > 0) return 1; // deja pornit
 
-    int pipe_in[2], pipe_out[2];
-    if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0) return 0;
+    int pipe_in[2];
+    int pipe_out[2];
+
+    if (pipe(pipe_in) < 0) return 0;
+    
+    if (pipe(pipe_out) < 0) {
+        close(pipe_in[0]);
+        close(pipe_in[1]);
+        return 0;
+    }
 
     sf_pid = fork();
-    if (sf_pid < 0) return 0;
+    if (sf_pid < 0) {
+        close(pipe_in[0]);
+        close(pipe_in[1]);
+        close(pipe_out[0]);
+        close(pipe_out[1]);
+        return 0;
+    }
 
     if (sf_pid == 0) {
         // proces copil -> stockfish
@@ -132,7 +190,7 @@ static int sf_start(void)
     return 1;
 }
 
-static void sf_stop(void)
+void sf_stop(void)
 {
     if (sf_pid <= 0) return;
     const char *cmd = "quit\n";
@@ -143,15 +201,18 @@ static void sf_stop(void)
     // asteapta putin sa se inchida
     usleep(100000);
     kill(sf_pid, SIGTERM);
+    waitpid(sf_pid, NULL, 0); // asteapta ca procesul copil sa se inchida complet (evita zombie process)
     sf_pid = -1;
 }
 
+// solicita o noua mutare de la motorul Stockfish bazat pe starea curenta a tablei
 static void sf_request_move(void)
 {
     char fen[256];
     board_to_fen(fen, (int)sizeof(fen));
 
     char cmd[512];
+    // transmitem pozitia si comandam inceperea calculului folosind adancimea selectata
     snprintf(cmd, sizeof(cmd), "position fen %s\ngo depth %d\n", fen, botDepth);
     write(sf_write_fd, cmd, strlen(cmd));
 
@@ -159,7 +220,8 @@ static void sf_request_move(void)
     memset(sf_bestmove, 0, sizeof(sf_bestmove));
 }
 
-// returneaza 1 daca a primit bestmove
+// verifica daca motorul a returnat o mutare ('bestmove') in urma comenzii 'go'
+// returneaza 1 daca mutarea a fost primita si parseaza rezultatul in sf_bestmove
 static int sf_poll_move(void)
 {
     if (sf_read_fd < 0) return 0;
@@ -173,12 +235,12 @@ static int sf_poll_move(void)
     if (bm) {
         sscanf(bm, "bestmove %7s", sf_bestmove);
         sf_buf_len = 0;
-        return 1;
+        return 1; // am gasit mutarea ideala calculata de bot
     }
-    return 0;
+    return 0; // inca se calculeaza
 }
 
-// executa mutarea botului din sf_bestmove
+// interpreteaza si aplica pe tabla mutarea returnata de Stockfish (aflata in sf_bestmove)
 static void execute_sf_move(void)
 {
     int c1 = sf_bestmove[0] - 'a';
@@ -230,7 +292,10 @@ static const char *piece_display(char p)
     return gFallbackBuf;
 }
 
-// helpers
+// functii ajutatoare pentru interfata grafica (GUI)
+
+// transforma coordonatele in pixeli ale mouse-ului in coordonate (linie, coloana) pe tabla
+// returneaza false daca click-ul a fost in afara tablei
 static bool PixToBoard(Vector2 mp, int *r, int *c)
 {
     int bx = (int)mp.x - BOARD_X;
@@ -241,7 +306,7 @@ static bool PixToBoard(Vector2 mp, int *r, int *c)
     return true;
 }
 
-//determina pe tabla care sunt pozitiile valide
+// calculeaza si memoreaza in matricea 'legal' toate mutarile posibile pentru piesa de la (r, c)
 static void ComputeLegal(int r, int c)
 {
     memset(legal, 0, sizeof(legal));
@@ -300,7 +365,7 @@ static void DrawPiece(char p, float x, float y)
 }
 
 //ecranul de start
-static void DrawHome(void)
+void DrawHome(void)
 {
     ClearBackground(C_BG);
 
@@ -325,30 +390,27 @@ static void DrawHome(void)
 
     float bw = 380.0f, bh = 58.0f, bx = (WIN_W - bw) * 0.5f;
 
-    // buton 2v2 local
+    // buton 1v1 local
     Rectangle b1 = { bx, 230, bw, bh };
-    if (Btn(b1, "Local 2v2", false)) {
+    if (Btn(b1, "Local 1v1", false)) {
         botMode = 0;
         init_board();
         current_turn = 0;
         selRow = selCol = -1;
+        hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
         gameSt = ST_SELECT;
         curScreen = SCR_GAME;
     }
 
-    //multiplayer
-    Rectangle b2 = { bx, 300, bw, bh };
-    Btn(b2, "Multiplayer", true);
-
     //contra bot - acum activat!
-    Rectangle b3 = { bx, 370, bw, bh };
+    Rectangle b3 = { bx, 300, bw, bh };
     if (Btn(b3, "Play Against Bot", false)) {
         curScreen = SCR_BOTSETUP;
     }
 }
 
 //ecranul de selectare a dificultatii botului
-static void DrawBotSetup(void)
+void DrawBotSetup(void)
 {
     ClearBackground(C_BG);
 
@@ -370,6 +432,12 @@ static void DrawBotSetup(void)
     const char *sub = "Choose difficulty (you play as White)";
     Vector2 sv = MeasureTextEx(gFont, sub, 20, 1);
     DrawTextEx(gFont, sub, (Vector2){ (WIN_W - sv.x) * 0.5f, 155.0f }, 20, 1, LIGHTGRAY);
+
+    load_stats();
+    char statBuf[128];
+    snprintf(statBuf, sizeof(statBuf), "Stats:  Wins: %d  |  Losses: %d  |  Streak: %d", pWins, pLosses, pStreak);
+    Vector2 stv = MeasureTextEx(gFont, statBuf, 18, 1);
+    DrawTextEx(gFont, statBuf, (Vector2){ (WIN_W - stv.x) * 0.5f, 190.0f }, 18, 1, GOLD);
 
     float bw = 380.0f, bh = 58.0f, bx = (WIN_W - bw) * 0.5f;
 
@@ -395,6 +463,7 @@ static void DrawBotSetup(void)
             init_board();
             current_turn = 0;
             selRow = selCol = -1;
+            hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
             gameSt = ST_SELECT;
             curScreen = SCR_GAME;
         }
@@ -409,6 +478,7 @@ static void DrawBotSetup(void)
             init_board();
             current_turn = 0;
             selRow = selCol = -1;
+            hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
             gameSt = ST_SELECT;
             curScreen = SCR_GAME;
         }
@@ -423,6 +493,7 @@ static void DrawBotSetup(void)
             init_board();
             current_turn = 0;
             selRow = selCol = -1;
+            hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
             gameSt = ST_SELECT;
             curScreen = SCR_GAME;
         }
@@ -436,7 +507,7 @@ static void DrawBotSetup(void)
 }
 
 //ecran de joc
-static void DrawGame(void)
+void DrawGame(void)
 {
     ClearBackground(C_BG);
     Vector2 mouse = GetMousePosition();
@@ -449,7 +520,20 @@ static void DrawGame(void)
     if (gameSt == ST_BOT_READY && GetTime() - botMoveReadyTime >= 1.0) {
         execute_sf_move();
         selRow = selCol = -1;
-        gameSt = has_legal_moves(current_turn) ? ST_SELECT : ST_GAMEOVER;
+        if (!has_legal_moves(current_turn)) {
+            set_game_over();
+        } else {
+            gameSt = ST_SELECT;
+        }
+    }
+
+    /* ── hint: polling pentru bestmove ── */
+    if (gameSt == ST_HINT_THINKING && sf_poll_move()) {
+        hintSrcCol = sf_bestmove[0] - 'a';
+        hintSrcRow = 8 - (sf_bestmove[1] - '0');
+        hintDstCol = sf_bestmove[2] - 'a';
+        hintDstRow = 8 - (sf_bestmove[3] - '0');
+        gameSt = ST_SELECT;
     }
 
     //calculeaza starea de sah
@@ -480,6 +564,12 @@ static void DrawGame(void)
             //evidentierea regelui in sah
             if (r == kingR && c == kingC)
                 DrawRectangle((int)x, (int)y, SQ, SQ, C_CHECK);
+
+            // evidentiere hint
+            if (r == hintSrcRow && c == hintSrcCol)
+                DrawRectangle((int)x, (int)y, SQ, SQ, (Color){ 50, 150, 200, 150 });
+            if (r == hintDstRow && c == hintDstCol)
+                DrawRectangle((int)x, (int)y, SQ, SQ, (Color){ 50, 150, 200, 200 });
 
             //indici pentru miscari legale
             if (selRow >= 0 && legal[r][c]) {
@@ -550,8 +640,8 @@ static void DrawGame(void)
         py += 36.0f;
     }
 
-    //indicator de gandire al botului
-    if (gameSt == ST_BOT_THINKING || gameSt == ST_BOT_READY) {
+    // indicator de incarcare afisat cat timp botul se gandeste sau asteptam un hint
+    if (gameSt == ST_BOT_THINKING || gameSt == ST_BOT_READY || gameSt == ST_HINT_THINKING) {
         // animatie cu puncte
         int dots = ((int)(GetTime() * 3.0)) % 4;
         char thinkTxt[20];
@@ -571,19 +661,29 @@ static void DrawGame(void)
     }
 
     // butoanele panoului
-    float btnY = (float)(PANEL_Y + PANEL_H - 115);
-    Rectangle rNew = { (float)PANEL_X, btnY, (float)(PANEL_W - 20), 45 };
-    Rectangle rMenu = { (float)PANEL_X, btnY + 57.0f,(float)(PANEL_W - 20), 45 };
+    float btnY = (float)(PANEL_Y + PANEL_H - 170);
+    Rectangle rHint = { (float)PANEL_X, btnY, (float)(PANEL_W - 20), 45 };
+    Rectangle rNew = { (float)PANEL_X, btnY + 57.0f, (float)(PANEL_W - 20), 45 };
+    Rectangle rMenu = { (float)PANEL_X, btnY + 114.0f,(float)(PANEL_W - 20), 45 };
 
+    if (Btn(rHint, "Suggest Move", gameSt != ST_SELECT)) {
+        if (sf_pid <= 0) sf_start();
+        if (sf_pid > 0) {
+            gameSt = ST_HINT_THINKING;
+            sf_request_move();
+        }
+    }
     if (Btn(rNew,  "New Game",  false)) {
         init_board();
         current_turn = 0;
         selRow = selCol = -1;
+        hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
         gameSt = ST_SELECT;
     }
     if (Btn(rMenu, "Main Menu", false)) {
         curScreen = SCR_HOME;
         selRow = selCol = -1;
+        hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
         gameSt = ST_SELECT;
     }
 
@@ -627,7 +727,7 @@ static void DrawGame(void)
                 selRow = selCol = -1;
 
                 if (!has_legal_moves(current_turn)) {
-                    gameSt = ST_GAMEOVER;
+                    set_game_over();
                 } else if (botMode && current_turn == 1) {
                     // dupa promovarea jucatorului, botul muta
                     gameSt = ST_BOT_THINKING;
@@ -672,17 +772,20 @@ static void DrawGame(void)
             init_board();
             current_turn = 0;
             selRow = selCol = -1;
+            hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
             gameSt = ST_SELECT;
         }
     }
 
-    //input tabla (activ doar in ST_SELECT)
+    // proceseaza inputul jucatorului pe tabla (permis doar in starea ST_SELECT)
     if (gameSt == ST_SELECT && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-        // in bot mode, blocheaza inputul cand e randul botului
+        hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1; // sterge vizualizarea hint-ului la orice click
+
+        // previne mutarile facute de om atunci cand este randul botului (negru)
         if (botMode && current_turn == 1) {
-            // nu ar trebui sa ajunga aici, dar safety check
+            // masura de precautie: click-urile sunt ignorate in acest moment
         } else {
-            int cr, cc;
+            int cr, cc; // rand curent (current row) si coloana curenta (current column) deduse din click
             if (PixToBoard(mouse, &cr, &cc)) {
                 if (selRow < 0) {
                     //primul click selecteaza o piesa proprie
@@ -703,25 +806,28 @@ static void DrawGame(void)
                     bool isProm = (toupper((unsigned char)moved) == 'P') && ((current_turn == 0 && cr == 0) || (current_turn == 1 && cr == 7));
 
                     if (isProm) {
+                        // am declansat o promovare, salvam datele si aratam meniul de promovare
                         promSrcRow = selRow; promSrcCol = selCol;
                         promDstRow = cr;     promDstCol = cc;
-                        selRow = selCol = -1;   // sterge evidentierea sub overlay
+                        selRow = selCol = -1;   // sterge vizual patratul selectat pentru a nu se suprapune cu meniul
                         gameSt = ST_PROMOTE;
                     } else {
-                        execute_move(selRow, selCol, cr, cc, 'Q');  // 'Q' nefolosit
-                        current_turn = 1 - current_turn;
-                        selRow = selCol = -1;
+                        // mutare normala
+                        execute_move(selRow, selCol, cr, cc, 'Q');  // 'Q' e transmis ca placeholder ignorat
+                        current_turn = 1 - current_turn; // schimba randul jucatorului
+                        selRow = selCol = -1; // deselecteaza
 
+                        // verifica daca dupa aceasta mutare jocul s-a terminat
                         if (!has_legal_moves(current_turn)) {
-                            gameSt = ST_GAMEOVER;
+                            set_game_over();
                         } else if (botMode && current_turn == 1) {
-                            // dupa mutarea jucatorului, botul muta
+                            // daca jocul continua si e modul vs bot, incepem sa cerem mutarea botului
                             gameSt = ST_BOT_THINKING;
                             sf_request_move();
                         }
                     }
                 } else {
-                    // click pe un patrat invalid -> deselecteaza
+                    // s-a dat click pe un patrat valid dar care nu corespunde niciunei mutari posibile
                     selRow = selCol = -1;
                 }
             }
@@ -729,13 +835,10 @@ static void DrawGame(void)
     }
 }
 
-//functia principala
-int main(void)
-{
-    SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_HIGHDPI);
-    InitWindow(WIN_W, WIN_H, "Chess");
-    SetTargetFPS(60);
+static bool gFontLoaded = false;
 
+void init_fonts(void)
+{
     //incarcarea fontului
     /* incearca sa incarce un font cu simboluri unicode pentru sah (U+2654..U+265F).
        foloseste fontul implicit din raylib daca nu este gasit niciunul.    */
@@ -756,16 +859,16 @@ int main(void)
     for (int i = 0; i < 95; i++) cps[i] = 32 + i;
     for (int i = 0; i < 12; i++) cps[95 + i] = 0x2654 + i;  /* ♔ to ♟ */
 
-    bool loaded = false;
-    for (int i = 0; i < numPaths && !loaded; i++) {
+    gFontLoaded = false;
+    for (int i = 0; i < numPaths && !gFontLoaded; i++) {
         if (FileExists(kFontPaths[i])) {
             gFont = LoadFontEx(kFontPaths[i], 64, cps, cpCount);
-            if (gFont.glyphCount > 0) loaded = true;
+            if (gFont.glyphCount > 0) gFontLoaded = true;
         }
     }
     free(cps);
 
-    if (loaded) {
+    if (gFontLoaded) {
         // verifica daca fontul incarcat contine simboluri de sah
         int idx = GetGlyphIndex(gFont, 0x2654);
         gFontHasChess = (idx > 0);
@@ -775,18 +878,9 @@ int main(void)
         TraceLog(LOG_WARNING,
                  "GUI: Unicode font not found - pieces shown as letters");
     }
+}
 
-    //bucla principala
-    while (!WindowShouldClose()) {
-        BeginDrawing();
-        if (curScreen == SCR_HOME)          DrawHome();
-        else if (curScreen == SCR_BOTSETUP) DrawBotSetup();
-        else                                DrawGame();
-        EndDrawing();
-    }
-
-    sf_stop();
-    if (loaded) UnloadFont(gFont);
-    CloseWindow();
-    return 0;
+void cleanup_fonts(void)
+{
+    if (gFontLoaded) UnloadFont(gFont);
 }

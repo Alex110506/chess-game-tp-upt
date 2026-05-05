@@ -16,7 +16,7 @@ all: chess
 chess: chess.c chess_logic.c
 	${CC} ${CFLAGS} -o chess $^
 
-gui: chess_gui.c chess_logic.c
+gui: gui.c chess_gui.c chess_logic.c
 	${CC} ${CFLAGS} -o chess_gui $^ ${RAYLIB_FLAGS}
 
 clean:
