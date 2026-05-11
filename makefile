@@ -16,8 +16,8 @@ all: chess
 chess: chess.c chess_logic.c
 	${CC} ${CFLAGS} -o chess $^
 
-gui: gui.c chess_gui.c chess_logic.c chess_net.c
-	${CC} ${CFLAGS} -o chess_gui $^ ${RAYLIB_FLAGS}
+gui: gui.c chess_gui.c chess_logic.c chess_net.c chess_auth.c
+	${CC} ${CFLAGS} -o chess_gui $^ ${RAYLIB_FLAGS} -lcurl
 
 clean:
 	rm -f chess chess_gui

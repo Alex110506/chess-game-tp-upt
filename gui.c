@@ -1,5 +1,6 @@
 #include "raylib.h"
 #include "chess_gui.h"
+#include "chess_auth.h"
 
 int main(void)
 {
@@ -11,11 +12,15 @@ int main(void)
     // initializam fonturile folosite pentru desenarea textului si a pieselor
     init_fonts();
 
+    // initializam libcurl si restauram sesiunea salvata (daca exista)
+    auth_init();
+    auth_load_session();
+
     // bucla principala a jocului
     // ruleaza pana cand utilizatorul inchide fereastra
     while (!WindowShouldClose()) {
         BeginDrawing();
-        
+
         // afiseaza ecranul corespunzator starii curente
         if (curScreen == SCR_HOME)
             DrawHome();
@@ -25,6 +30,12 @@ int main(void)
             DrawMpSetup();
         else if (curScreen == SCR_MPLOBBY)
             DrawMpLobby();
+        else if (curScreen == SCR_PUZZLESETUP)
+            DrawPuzzleSetup();
+        else if (curScreen == SCR_LOGIN)
+            DrawLogin();
+        else if (curScreen == SCR_PROFILE)
+            DrawProfile();
         else
             DrawGame();
 
@@ -37,8 +48,10 @@ int main(void)
     mp_cleanup();
     // eliberam memoria ocupata de fonturi
     cleanup_fonts();
+    // curatam libcurl
+    auth_cleanup();
     // inchidem fereastra raylib si eliberam resursele
     CloseWindow();
-    
+
     return 0;
 }

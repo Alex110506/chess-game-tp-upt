@@ -37,4 +37,10 @@ void execute_move(int r1, int c1, int r2, int c2, char promotion_piece);
 // genereaza string-ul FEN al pozitiei curente (pentru comunicarea starii cu engine-ul Stockfish)
 void board_to_fen(char *fen, int max_len);
 
+// incarca o pozitie predefinita pentru o problema/puzzle de sah
+// setup[r][c] contine caracterele pieselor (sau '.' pentru gol),
+// side_to_move: 0 = alb muta, 1 = negru muta
+// dezactiveaza rocada si en passant (pozitii arbitrare de puzzle)
+void load_puzzle_position(const char setup[8][9], int side_to_move);
+
 #endif

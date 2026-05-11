@@ -112,14 +112,32 @@ static void send_line(const char *line)
     (void)n;  // best-effort; conexiunea va fi vazuta ca inchisa daca esueaza
 }
 
-void net_send_create(void)
+// sanitizeaza un username (alfanumeric + underscore, max 16 chars) intr-un buffer dat
+static void sanitize_username(const char *src, char *dst, int dst_sz)
 {
-    send_line("{\"type\":\"create\"}\n");
+    int j = 0;
+    for (int i = 0; src && src[i] && j < dst_sz - 1; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (isalnum(c) || c == '_') dst[j++] = (char)c;
+    }
+    dst[j] = '\0';
 }
 
-void net_send_join(const char *code)
+void net_send_create(const char *username)
 {
-    char buf[64];
+    char ubuf[24] = {0};
+    sanitize_username(username, ubuf, sizeof(ubuf));
+    char buf[96];
+    if (ubuf[0])
+        snprintf(buf, sizeof(buf), "{\"type\":\"create\",\"username\":\"%s\"}\n", ubuf);
+    else
+        snprintf(buf, sizeof(buf), "{\"type\":\"create\"}\n");
+    send_line(buf);
+}
+
+void net_send_join(const char *code, const char *username)
+{
+    char buf[128];
     // sanitizam codul: doar alfanumerice, max 4 chars
     char clean[8] = {0};
     int j = 0;
@@ -127,7 +145,13 @@ void net_send_join(const char *code)
         unsigned char c = (unsigned char)code[i];
         if (isalnum(c)) clean[j++] = (char)toupper(c);
     }
-    snprintf(buf, sizeof(buf), "{\"type\":\"join\",\"code\":\"%s\"}\n", clean);
+    char ubuf[24] = {0};
+    sanitize_username(username, ubuf, sizeof(ubuf));
+    if (ubuf[0])
+        snprintf(buf, sizeof(buf),
+                 "{\"type\":\"join\",\"code\":\"%s\",\"username\":\"%s\"}\n", clean, ubuf);
+    else
+        snprintf(buf, sizeof(buf), "{\"type\":\"join\",\"code\":\"%s\"}\n", clean);
     send_line(buf);
 }
 
@@ -204,10 +228,11 @@ static int parse_line(const char *line, NetMsg *out)
     out->type = type_from_str(tbuf);
     if (out->type == NM_NONE) return 0;
 
-    json_get_str(line, "code",  out->code,  sizeof(out->code));
-    json_get_str(line, "color", out->color, sizeof(out->color));
-    json_get_str(line, "uci",   out->uci,   sizeof(out->uci));
-    json_get_str(line, "msg",   out->msg,   sizeof(out->msg));
+    json_get_str(line, "code",     out->code,     sizeof(out->code));
+    json_get_str(line, "color",    out->color,    sizeof(out->color));
+    json_get_str(line, "uci",      out->uci,      sizeof(out->uci));
+    json_get_str(line, "msg",      out->msg,      sizeof(out->msg));
+    json_get_str(line, "opponent", out->opponent, sizeof(out->opponent));
     return 1;
 }
 

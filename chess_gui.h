@@ -13,6 +13,9 @@ typedef enum {
     SCR_BOTSETUP,
     SCR_MPSETUP,    // alegerea intre host si join pentru multiplayer
     SCR_MPLOBBY,    // gazda asteapta un oponent (afiseaza codul camerei)
+    SCR_PUZZLESETUP, // alegerea unui puzzle "checkmate in N"
+    SCR_LOGIN,      // ecran de autentificare/inregistrare
+    SCR_PROFILE,    // profilul jucatorului (stats si rank)
     SCR_GAME
 } Screen;
 
@@ -28,6 +31,9 @@ void DrawHome(void);
 void DrawBotSetup(void);
 void DrawMpSetup(void);
 void DrawMpLobby(void);
+void DrawPuzzleSetup(void);
+void DrawLogin(void);
+void DrawProfile(void);
 void DrawGame(void);
 
 // opreste procesul motorului de sah (Stockfish) in caz de iesire

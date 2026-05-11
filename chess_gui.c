@@ -9,6 +9,7 @@
 #include "chess_logic.h"
 #include "chess_gui.h"
 #include "chess_net.h"
+#include "chess_auth.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -95,6 +96,120 @@ static int pStreak = 0;
 static bool statsLoaded = false;
 static const char *STATS_FILE = "chess_stats.txt";
 
+// stare ecran login: bufferele de input + focus + mesaje
+static char loginUser[AUTH_USERNAME_MAX] = "";
+static char loginPass[64] = "";
+static int  loginFocus = 0;            // 0 = username, 1 = parola
+static char loginStatus[128] = "";     // mesaj de eroare/info
+static Color loginStatusColor = { 220, 60, 60, 255 };
+static bool loginBusy = false;         // true cat timp ruleaza un request HTTP
+
+// stare ecran multiplayer: numele oponentului si rezultat (pentru report ELO)
+static char mpOpponent[AUTH_USERNAME_MAX] = "";
+static bool mpResultReported = false;
+
+// gate pentru multiplayer cand nu suntem logati
+static bool showLoginGate = false;
+
+// stare mod "puzzle" (probleme de sah cu sah-mat in N mutari)
+static int  puzzleMode = 0;        // 1 = jucam un puzzle
+static int  puzzleIdx = 0;         // indexul puzzle-ului curent
+static int  puzzleUserColor = 0;   // culoarea cu care joaca jucatorul in puzzle (0 alb / 1 negru)
+static int  puzzleTarget = 0;      // numarul de mutari maxim pentru sah-mat
+static int  puzzleMoveCount = 0;   // mutarile facute pana acum de jucator
+static bool puzzleSolved = false;  // true daca jucatorul a livrat sah-mat
+static bool puzzleFailed = false;  // true daca jucatorul nu a reusit sah-mat in N mutari
+
+// definitia unui puzzle: pozitie + cine muta + numarul tinta de mutari
+typedef struct {
+    const char *name;
+    const char *desc;
+    char setup[8][9];   // 8 randuri x 8 caractere + null
+    int side_to_move;   // 0 alb / 1 negru
+    int target;         // sah-mat in N mutari
+} Puzzle;
+
+// colectie de puzzle-uri predefinite verificate manual
+static const Puzzle gPuzzles[] = {
+    {
+        "Back Rank Mate",
+        "White to move. Deliver mate in 1.",
+        {
+            "......k.",
+            ".....ppp",
+            "........",
+            "........",
+            "........",
+            "........",
+            "........",
+            "R.....K."
+        },
+        0, 1
+    },
+    {
+        "Queen's Crown",
+        "White to move. Mate in 1 with king support.",
+        {
+            ".......k",
+            "........",
+            ".....K..",
+            "........",
+            "........",
+            "......Q.",
+            "........",
+            "........"
+        },
+        0, 1
+    },
+    {
+        "Smothered Mate",
+        "White to move. The knight finishes the job in 1.",
+        {
+            "......rk",
+            "......pp",
+            ".......N",
+            "........",
+            "........",
+            "........",
+            "........",
+            "......K."
+        },
+        0, 1
+    },
+    {
+        "Arabian Mate",
+        "White to move. Mate in 1 with rook and knight.",
+        {
+            ".......k",
+            "........",
+            ".....N.K",
+            "........",
+            "........",
+            "........",
+            "........",
+            "R......."
+        },
+        0, 1
+    },
+    {
+        "Pawn Crusher",
+        "White to move. Corner the king with two rooks. Mate in 2.",
+        {
+            "k.......",
+            "p.......",
+            "..K.....",
+            "........",
+            "........",
+            "........",
+            "........",
+            "RR......"
+        },
+        0, 2
+    }
+};
+
+static const int gPuzzleCount = (int)(sizeof(gPuzzles) / sizeof(gPuzzles[0]));
+
 // stare multiplayer
 static int  mpMode = 0;            // 1 = joc online prin server
 static int  mpMyColor = 0;         // 0 = alb, 1 = negru (coloarea pe care o jucam)
@@ -124,6 +239,9 @@ static void save_stats(void) {
     }
 }
 
+// forward decl pentru raportarea rezultatului online
+static void mp_report_result(const char *result);
+
 // functie care marcheaza finalul de joc si actualizeaza statisticile (doar vs bot)
 static void set_game_over(void) {
     gameSt = ST_GAMEOVER;
@@ -141,8 +259,27 @@ static void set_game_over(void) {
             pStreak = 0;
         }
         save_stats();
+    } else if (puzzleMode) {
+        // in modul puzzle: succes daca oponentul e in sah-mat
+        bool mate = is_in_check(current_turn);
+        puzzleSolved = mate && (current_turn != puzzleUserColor);
+        puzzleFailed = !puzzleSolved;
+    } else if (mpMode) {
+        // raporteaza rezultatul partidei online catre backend (ELO)
+        bool mate = is_in_check(current_turn);
+        if (mate) {
+            // jucatorul care sta sa mute e mat -> pierde
+            const char *r = (current_turn == mpMyColor) ? "loss" : "win";
+            mp_report_result(r);
+        } else {
+            mp_report_result("draw");
+        }
     }
 }
+
+// declaratii forward pentru functiile Stockfish (definite mai jos)
+static int sf_start(void);
+static void sf_request_move(void);
 
 // ─── helper-i multiplayer ────────────────────────────────────────────────
 
@@ -210,6 +347,37 @@ static int mp_apply_remote_move(const char *uci)
     return 1;
 }
 
+// porneste un puzzle: incarca pozitia, deschide Stockfish si trece la SCR_GAME
+static int start_puzzle(int idx)
+{
+    if (idx < 0 || idx >= gPuzzleCount) return 0;
+    if (!FileExists(SF_PATH)) return 0;
+    if (!sf_start()) return 0;
+
+    puzzleMode = 1;
+    puzzleIdx = idx;
+    puzzleUserColor = gPuzzles[idx].side_to_move;
+    puzzleTarget = gPuzzles[idx].target;
+    puzzleMoveCount = 0;
+    puzzleSolved = false;
+    puzzleFailed = false;
+
+    // dezactivam modurile concurente
+    botMode = 0;
+    mpMode = 0;
+
+    // adancimea pentru aparare in puzzle - destul de mare pentru a apara optim
+    botDepth = 14;
+
+    load_puzzle_position(gPuzzles[idx].setup, gPuzzles[idx].side_to_move);
+
+    selRow = selCol = -1;
+    hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+    gameSt = ST_SELECT;
+    curScreen = SCR_GAME;
+    return 1;
+}
+
 // porneste un joc online (din lobby cand vine 'start'). reseteaza tabla.
 static void mp_begin_game(void)
 {
@@ -220,9 +388,27 @@ static void mp_begin_game(void)
     botMode = 0;
     mpMode = 1;  // activeaza modul multiplayer
     mpOpponentLeft = false;
+    mpResultReported = false;
     // gazda (alb) muta primul; daca eu sunt alb, sunt la rand
     gameSt = (mpMyColor == current_turn) ? ST_SELECT : ST_WAIT_OPP;
     curScreen = SCR_GAME;
+}
+
+// raporteaza rezultatul jocului multiplayer catre backend, daca utilizatorul
+// este logat si suntem in mod multiplayer ranked. result: "win"|"loss"|"draw"
+static void mp_report_result(const char *result)
+{
+    if (mpResultReported) return;
+    if (!mpMode) return;
+    if (!gAuth.logged_in) return;
+    mpResultReported = true;
+    char err[AUTH_ERR_MAX] = {0};
+    if (auth_report_game(result, mpOpponent[0] ? mpOpponent : NULL, err, sizeof(err))) {
+        // afisam noul rank in caseta de sfarsit
+        snprintf(mpStatus, sizeof(mpStatus), "New rank: %d", gAuth.rank);
+    } else {
+        snprintf(mpStatus, sizeof(mpStatus), "Rank update failed: %.96s", err);
+    }
 }
 
 static int sf_start(void)
@@ -393,8 +579,17 @@ static const char *piece_display(char p)
 
 // functii ajutatoare pentru interfata grafica (GUI)
 
+// returneaza true daca tabla trebuie afisata inversat (jucatorul cu negru)
+static bool board_flipped(void)
+{
+    if (mpMode && mpMyColor == 1) return true;
+    if (puzzleMode && puzzleUserColor == 1) return true;
+    return false;
+}
+
 // transforma coordonatele in pixeli ale mouse-ului in coordonate (linie, coloana) pe tabla
 // returneaza false daca click-ul a fost in afara tablei
+// tine cont de inversarea tablei cand jucam cu piesele negre
 static bool PixToBoard(Vector2 mp, int *r, int *c)
 {
     int bx = (int)mp.x - BOARD_X;
@@ -402,6 +597,10 @@ static bool PixToBoard(Vector2 mp, int *r, int *c)
     if (bx < 0 || by < 0 || bx >= BOARD_PX || by >= BOARD_PX) return false;
     *c = bx / SQ;
     *r = by / SQ;
+    if (board_flipped()) {
+        *c = 7 - *c;
+        *r = 7 - *r;
+    }
     return true;
 }
 
@@ -463,35 +662,141 @@ static void DrawPiece(char p, float x, float y)
     DrawPieceAt(p, x + SQ * 0.5f, y + SQ * 0.5f, SQ * 0.38f);
 }
 
+// deseneaza un buton mare cu o piesa de sah ca pictograma in stanga
+// returneaza true daca a fost apasat
+static bool BigBtn(Rectangle r, char piece, const char *title, const char *subtitle, bool dis)
+{
+    Vector2 mouse = GetMousePosition();
+    bool hov = !dis && CheckCollisionPointRec(mouse, r);
+    Color bg = dis ? C_BTN_DIS : (hov ? C_BTN_HOV : C_BTN);
+    Color border = dis ? DARKGRAY : (hov ? LIME : GREEN);
+
+    // umbra subtila sub buton
+    DrawRectangleRounded((Rectangle){ r.x + 3, r.y + 4, r.width, r.height }, 0.22f, 8, (Color){0, 0, 0, 110});
+    DrawRectangleRounded(r, 0.22f, 8, bg);
+    DrawRectangleRoundedLines(r, 0.22f, 8, border);
+
+    // pictograma piesa in stanga
+    float iconCx = r.x + 38.0f;
+    float iconCy = r.y + r.height * 0.5f;
+    DrawPieceAt(piece, iconCx, iconCy, 22.0f);
+
+    // titlul butonului
+    float textX = r.x + 78.0f;
+    Vector2 tsz = MeasureTextEx(gFont, title, 24, 1);
+    DrawTextEx(gFont, title,
+               (Vector2){ textX, r.y + (subtitle ? 12.0f : (r.height - tsz.y) * 0.5f) },
+               24, 1, dis ? GRAY : WHITE);
+
+    if (subtitle) {
+        DrawTextEx(gFont, subtitle, (Vector2){ textX, r.y + 42.0f }, 14, 1,
+                   dis ? (Color){90, 90, 90, 255} : (Color){200, 220, 200, 230});
+    }
+
+    return hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+}
+
 //ecranul de start
 void DrawHome(void)
 {
     ClearBackground(C_BG);
+    Vector2 mouse = GetMousePosition();
 
-    //model de tabla blurat in spate
+    // === fundal: model de tabla intunecata cu o vinieta usoara ===
     int tw = WIN_W / 12, th = WIN_H / 10;
     for (int rr = 0; rr < 10; rr++)
         for (int cc = 0; cc < 12; cc++) {
             unsigned char v = (rr + cc) % 2 == 0 ? 30 : 24;
             DrawRectangle(cc * tw, rr * th, tw + 1, th + 1, (Color){v, v, v, 255});
         }
+    // overlay radial subtil pentru a focaliza atentia spre centru
+    for (int i = 0; i < 4; i++) {
+        DrawRectangle(0, 0, WIN_W, 60 + i * 12, (Color){0, 0, 0, 30});
+        DrawRectangle(0, WIN_H - 60 - i * 12, WIN_W, 60 + i * 12, (Color){0, 0, 0, 30});
+    }
 
-    // titlu
+    // === bara de profil sus-dreapta ===
+    {
+        float pbW = 230.0f, pbH = 44.0f;
+        float pbX = WIN_W - pbW - 16.0f, pbY = 16.0f;
+        Rectangle pb = { pbX, pbY, pbW, pbH };
+        bool hov = CheckCollisionPointRec(mouse, pb);
+
+        Color bg = hov ? (Color){55, 75, 60, 255} : (Color){40, 50, 42, 235};
+        Color border = hov ? LIME : (Color){90, 130, 100, 255};
+        DrawRectangleRounded(pb, 0.45f, 8, bg);
+        DrawRectangleRoundedLines(pb, 0.45f, 8, border);
+
+        // pictograma "user" rotunda
+        DrawCircle((int)(pbX + 22), (int)(pbY + pbH * 0.5f), 14, (Color){25, 30, 26, 255});
+        DrawCircle((int)(pbX + 22), (int)(pbY + pbH * 0.5f - 3), 5, (Color){200, 200, 200, 255});
+        DrawRectangleRounded((Rectangle){ pbX + 14, pbY + pbH * 0.5f + 2, 16, 8 }, 0.5f, 8,
+                             (Color){200, 200, 200, 255});
+
+        if (gAuth.logged_in) {
+            // username + rank
+            DrawTextEx(gFont, gAuth.username, (Vector2){ pbX + 44, pbY + 6 }, 18, 1, WHITE);
+            char rkbuf[24];
+            snprintf(rkbuf, sizeof(rkbuf), "Rank %d", gAuth.rank);
+            DrawTextEx(gFont, rkbuf, (Vector2){ pbX + 44, pbY + 24 }, 14, 1, GOLD);
+        } else {
+            DrawTextEx(gFont, "Sign in", (Vector2){ pbX + 44, pbY + 6 }, 18, 1, WHITE);
+            DrawTextEx(gFont, "to track rank", (Vector2){ pbX + 44, pbY + 24 }, 12, 1,
+                       (Color){200, 220, 200, 230});
+        }
+
+        if (hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            if (gAuth.logged_in) {
+                loginStatus[0] = '\0';
+                curScreen = SCR_PROFILE;
+            } else {
+                loginStatus[0] = '\0';
+                loginUser[0] = '\0';
+                loginPass[0] = '\0';
+                curScreen = SCR_LOGIN;
+            }
+        }
+    }
+
+    // === piese decorative langa titlu ===
+    DrawPieceAt('K', 140.0f, 110.0f, 36.0f);
+    DrawPieceAt('q', WIN_W - 140.0f, 110.0f, 36.0f);
+
+    // === titlu cu umbra/glow ===
     const char *title = "CHESS GAME";
-    int titleSize = 80;
-    Vector2 tv = MeasureTextEx(gFont, title, titleSize, 2);
-    DrawTextEx(gFont, title, (Vector2){ (WIN_W - tv.x) * 0.5f, 65.0f }, titleSize, 2, WHITE);
+    int titleSize = 88;
+    Vector2 tv = MeasureTextEx(gFont, title, titleSize, 3);
+    float titleX = (WIN_W - tv.x) * 0.5f;
+    float titleY = 70.0f;
 
-    //subtitlu
-    const char *sub = "Select a game mode";
-    Vector2 sv = MeasureTextEx(gFont, sub, 20, 1);
-    DrawTextEx(gFont, sub, (Vector2){ (WIN_W - sv.x) * 0.5f, 175.0f }, 20, 1, LIGHTGRAY);
+    // straturi de umbra pentru efect de adancime
+    for (int i = 3; i >= 1; i--) {
+        DrawTextEx(gFont, title, (Vector2){ titleX + i, titleY + i }, titleSize, 3, (Color){0, 0, 0, 130});
+    }
+    DrawTextEx(gFont, title, (Vector2){ titleX, titleY }, titleSize, 3, (Color){245, 235, 205, 255});
 
-    float bw = 380.0f, bh = 58.0f, bx = (WIN_W - bw) * 0.5f;
+    // accent auriu sub titlu
+    float underlineW = tv.x * 0.45f;
+    DrawRectangle((int)((WIN_W - underlineW) * 0.5f), (int)(titleY + tv.y + 8), (int)underlineW, 3, GOLD);
 
-    // buton 1v1 local
-    Rectangle b1 = { bx, 230, bw, bh };
-    if (Btn(b1, "Local 1v1", false)) {
+    // subtitlu
+    const char *sub = "Choose your game mode";
+    Vector2 sv = MeasureTextEx(gFont, sub, 22, 1);
+    DrawTextEx(gFont, sub, (Vector2){ (WIN_W - sv.x) * 0.5f, titleY + tv.y + 22.0f }, 22, 1, LIGHTGRAY);
+
+    // === grila 2x2 de butoane mari ===
+    float bw = 340.0f, bh = 76.0f;
+    float gap = 26.0f;
+    float gridW = bw * 2 + gap;
+    float bx0 = (WIN_W - gridW) * 0.5f;
+    float byTop = 260.0f;
+
+    Rectangle b1 = { bx0,              byTop,                  bw, bh };
+    Rectangle b2 = { bx0 + bw + gap,   byTop,                  bw, bh };
+    Rectangle b3 = { bx0,              byTop + bh + gap,       bw, bh };
+    Rectangle b4 = { bx0 + bw + gap,   byTop + bh + gap,       bw, bh };
+
+    if (BigBtn(b1, 'K', "Local 1v1", "Play side by side", false)) {
         botMode = 0;
         init_board();
         current_turn = 0;
@@ -501,17 +806,69 @@ void DrawHome(void)
         curScreen = SCR_GAME;
     }
 
-    //contra bot - acum activat!
-    Rectangle b3 = { bx, 300, bw, bh };
-    if (Btn(b3, "Play Against Bot", false)) {
+    if (BigBtn(b2, 'n', "Play vs Bot", "Easy / Medium / Hard", false)) {
         curScreen = SCR_BOTSETUP;
     }
 
-    // multiplayer online (host / join cu cod camera)
-    Rectangle b4 = { bx, 370, bw, bh };
-    if (Btn(b4, "Multiplayer (Online)", false)) {
-        mp_reset_state();
-        curScreen = SCR_MPSETUP;
+    if (BigBtn(b3, 'r', "Multiplayer", "Host or join online", false)) {
+        if (!gAuth.logged_in) {
+            showLoginGate = true;
+        } else {
+            mp_reset_state();
+            curScreen = SCR_MPSETUP;
+        }
+    }
+
+    if (BigBtn(b4, 'Q', "Puzzles", "Solve checkmate puzzles", false)) {
+        curScreen = SCR_PUZZLESETUP;
+    }
+
+    // === statistici jos ===
+    load_stats();
+    char statBuf[160];
+    snprintf(statBuf, sizeof(statBuf), "Wins: %d   |   Losses: %d   |   Win Streak: %d", pWins, pLosses, pStreak);
+    Vector2 stv = MeasureTextEx(gFont, statBuf, 18, 1);
+    DrawTextEx(gFont, statBuf, (Vector2){ (WIN_W - stv.x) * 0.5f, WIN_H - 48.0f }, 18, 1, GOLD);
+
+    // mic footer
+    const char *foot = "UPT  -  Chess Game";
+    Vector2 fv = MeasureTextEx(gFont, foot, 12, 1);
+    DrawTextEx(gFont, foot, (Vector2){ (WIN_W - fv.x) * 0.5f, WIN_H - 22.0f }, 12, 1, (Color){120, 120, 120, 255});
+
+    // === overlay: prompt de login inainte de multiplayer ===
+    if (showLoginGate) {
+        DrawRectangle(0, 0, WIN_W, WIN_H, (Color){0, 0, 0, 170});
+
+        float dw = 460.0f, dh = 220.0f;
+        float dx = (WIN_W - dw) * 0.5f, dy = (WIN_H - dh) * 0.5f;
+        DrawRectangleRounded((Rectangle){ dx, dy, dw, dh }, 0.12f, 8, (Color){50, 60, 52, 255});
+        DrawRectangleRoundedLines((Rectangle){ dx, dy, dw, dh }, 0.12f, 8, (Color){90, 130, 100, 255});
+
+        const char *gt = "Sign in to play ranked";
+        Vector2 gv = MeasureTextEx(gFont, gt, 26, 1);
+        DrawTextEx(gFont, gt, (Vector2){ dx + (dw - gv.x) * 0.5f, dy + 28 }, 26, 1, WHITE);
+
+        const char *gs = "Online matches update your ELO rank.";
+        Vector2 gsv = MeasureTextEx(gFont, gs, 16, 1);
+        DrawTextEx(gFont, gs, (Vector2){ dx + (dw - gsv.x) * 0.5f, dy + 70 }, 16, 1, LIGHTGRAY);
+
+        float ibw = 180.0f, ibh = 44.0f, igap = 14.0f;
+        float startX = dx + (dw - (ibw * 2 + igap)) * 0.5f;
+        Rectangle bLogin = { startX, dy + dh - 70, ibw, ibh };
+        Rectangle bGuest = { startX + ibw + igap, dy + dh - 70, ibw, ibh };
+
+        if (Btn(bLogin, "Log In", false)) {
+            showLoginGate = false;
+            curScreen = SCR_LOGIN;
+        }
+        if (Btn(bGuest, "Play as Guest", false)) {
+            showLoginGate = false;
+            mp_reset_state();
+            curScreen = SCR_MPSETUP;
+        }
+
+        // ESC inchide overlay-ul
+        if (IsKeyPressed(KEY_ESCAPE)) showLoginGate = false;
     }
 }
 
@@ -641,8 +998,12 @@ static void mp_drain_menu_messages(void)
             mpRoomCode[sizeof(mpRoomCode) - 1] = '\0';
             mpMyColor = 1; // invitatul joaca cu negrul
             mpStatus[0] = '\0';
+            if (m.opponent[0])
+                snprintf(mpOpponent, sizeof(mpOpponent), "%s", m.opponent);
             // jocul incepe la primirea mesajului 'start'
         } else if (m.type == NM_START) {
+            if (m.opponent[0])
+                snprintf(mpOpponent, sizeof(mpOpponent), "%s", m.opponent);
             mp_begin_game();
         } else if (m.type == NM_ERROR) {
             snprintf(mpStatus, sizeof(mpStatus), "Error: %s", m.msg);
@@ -684,7 +1045,7 @@ void DrawMpSetup(void)
         }
         if (net_running()) {
             mpHosting = true;
-            net_send_create();
+            net_send_create(gAuth.logged_in ? gAuth.username : NULL);
             mpStatus[0] = '\0';
         }
     }
@@ -735,7 +1096,7 @@ void DrawMpSetup(void)
             }
         }
         if (net_running()) {
-            net_send_join(mpJoinInput);
+            net_send_join(mpJoinInput, gAuth.logged_in ? gAuth.username : NULL);
             mpStatus[0] = '\0';
         }
     }
@@ -744,7 +1105,7 @@ void DrawMpSetup(void)
     if (joinReady && IsKeyPressed(KEY_ENTER)) {
         if (!net_running()) net_start(NULL);
         if (net_running()) {
-            net_send_join(mpJoinInput);
+            net_send_join(mpJoinInput, gAuth.logged_in ? gAuth.username : NULL);
             mpStatus[0] = '\0';
         }
     }
@@ -805,6 +1166,347 @@ void DrawMpLobby(void)
     }
 }
 
+// ecranul de selectare a puzzle-urilor
+void DrawPuzzleSetup(void)
+{
+    draw_menu_bg();
+    Vector2 mouse = GetMousePosition();
+
+    const char *title = "CHESS PUZZLES";
+    int titleSize = 60;
+    Vector2 tv = MeasureTextEx(gFont, title, titleSize, 2);
+    DrawTextEx(gFont, title, (Vector2){ (WIN_W - tv.x) * 0.5f, 50.0f }, titleSize, 2, WHITE);
+
+    const char *sub = "Find the fastest checkmate";
+    Vector2 sv = MeasureTextEx(gFont, sub, 20, 1);
+    DrawTextEx(gFont, sub, (Vector2){ (WIN_W - sv.x) * 0.5f, 130.0f }, 20, 1, LIGHTGRAY);
+
+    bool sfExists = FileExists(SF_PATH);
+    if (!sfExists) {
+        const char *err = "Stockfish engine not found!";
+        Vector2 ev = MeasureTextEx(gFont, err, 22, 1);
+        DrawTextEx(gFont, err, (Vector2){ (WIN_W - ev.x) * 0.5f, 165.0f }, 22, 1, RED);
+
+        const char *hint = "Puzzles need Stockfish to defend - expected at stockfish/src/stockfish";
+        Vector2 hv = MeasureTextEx(gFont, hint, 14, 1);
+        DrawTextEx(gFont, hint, (Vector2){ (WIN_W - hv.x) * 0.5f, 195.0f }, 14, 1, GRAY);
+    }
+
+    // lista cu puzzle-urile - cate un card pe rand
+    float cw = 620.0f, ch = 64.0f;
+    float gap = 12.0f;
+    float cx = (WIN_W - cw) * 0.5f;
+    float cyTop = 230.0f;
+
+    for (int i = 0; i < gPuzzleCount; i++) {
+        Rectangle r = { cx, cyTop + i * (ch + gap), cw, ch };
+        bool hov = sfExists && CheckCollisionPointRec(mouse, r);
+
+        // umbra
+        DrawRectangleRounded((Rectangle){ r.x + 2, r.y + 3, r.width, r.height }, 0.18f, 8, (Color){0, 0, 0, 100});
+
+        Color bg = !sfExists ? C_BTN_DIS : (hov ? C_BTN_HOV : (Color){ 44, 60, 48, 255 });
+        Color border = !sfExists ? DARKGRAY : (hov ? LIME : (Color){ 80, 120, 90, 255 });
+        DrawRectangleRounded(r, 0.18f, 8, bg);
+        DrawRectangleRoundedLines(r, 0.18f, 8, border);
+
+        // numar puzzle (cerc cu index)
+        DrawCircle((int)(r.x + 30), (int)(r.y + r.height * 0.5f), 18, (Color){ 30, 30, 30, 255 });
+        char idxBuf[4];
+        snprintf(idxBuf, sizeof(idxBuf), "%d", i + 1);
+        Vector2 iv = MeasureTextEx(gFont, idxBuf, 22, 1);
+        DrawTextEx(gFont, idxBuf,
+                   (Vector2){ r.x + 30 - iv.x * 0.5f, r.y + r.height * 0.5f - iv.y * 0.5f },
+                   22, 1, GOLD);
+
+        // numele puzzle-ului
+        DrawTextEx(gFont, gPuzzles[i].name, (Vector2){ r.x + 64, r.y + 8 }, 22, 1, WHITE);
+
+        // descriere
+        DrawTextEx(gFont, gPuzzles[i].desc, (Vector2){ r.x + 64, r.y + 36 }, 14, 1, (Color){200, 220, 200, 230});
+
+        // eticheta "Mate in N"
+        char mateBuf[24];
+        snprintf(mateBuf, sizeof(mateBuf), "Mate in %d", gPuzzles[i].target);
+        Vector2 mv = MeasureTextEx(gFont, mateBuf, 18, 1);
+        DrawTextEx(gFont, mateBuf,
+                   (Vector2){ r.x + r.width - mv.x - 18.0f, r.y + r.height * 0.5f - mv.y * 0.5f },
+                   18, 1, GOLD);
+
+        if (hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            start_puzzle(i);
+        }
+    }
+
+    // Buton Back
+    float bw = 380.0f, bh = 50.0f, bx = (WIN_W - bw) * 0.5f;
+    Rectangle bBack = { bx, WIN_H - 70.0f, bw, bh };
+    if (Btn(bBack, "Back", false)) {
+        curScreen = SCR_HOME;
+    }
+}
+
+// deseneaza un input field rotunjit cu placeholder + cursor; updateaza 'buf'
+// in functie de tastele apasate cand 'focused' este true. 'mask' afiseaza '*'.
+static void TextInput(Rectangle r, char *buf, int buf_sz, const char *placeholder,
+                      bool mask, bool focused, bool *clicked_into)
+{
+    Vector2 mouse = GetMousePosition();
+    bool hov = CheckCollisionPointRec(mouse, r);
+    Color border = focused ? LIME : (hov ? (Color){120, 180, 130, 255} : DARKGRAY);
+
+    DrawRectangleRounded(r, 0.18f, 8, (Color){ 35, 35, 35, 255 });
+    DrawRectangleRoundedLines(r, 0.18f, 8, border);
+
+    // text afisat (cu mascare daca e parola)
+    char shown[128];
+    int len = (int)strlen(buf);
+    if (mask) {
+        int n = len < (int)sizeof(shown) - 1 ? len : (int)sizeof(shown) - 1;
+        for (int i = 0; i < n; i++) shown[i] = '*';
+        shown[n] = '\0';
+    } else {
+        snprintf(shown, sizeof(shown), "%s", buf);
+    }
+
+    const char *display = (shown[0] != '\0') ? shown : placeholder;
+    Color tc = (shown[0] != '\0') ? WHITE : (Color){120, 120, 120, 255};
+    Vector2 dv = MeasureTextEx(gFont, display, 22, 1);
+    float tx = r.x + 18.0f;
+    float ty = r.y + (r.height - dv.y) * 0.5f;
+    DrawTextEx(gFont, display, (Vector2){ tx, ty }, 22, 1, tc);
+
+    // cursor cand suntem focusati
+    if (focused) {
+        float caretX = tx + (shown[0] != '\0' ? MeasureTextEx(gFont, shown, 22, 1).x : 0);
+        if (((int)(GetTime() * 2)) % 2 == 0) {
+            DrawRectangle((int)(caretX + 2), (int)(r.y + 12), 2, (int)(r.height - 24), LIME);
+        }
+        // input din tastatura
+        int ch = GetCharPressed();
+        while (ch > 0) {
+            int curLen = (int)strlen(buf);
+            // pentru username acceptam doar alfanumeric + underscore
+            // pentru password acceptam orice imprimabil
+            bool accept;
+            if (mask) accept = (ch >= 32 && ch < 127);
+            else      accept = (isalnum(ch) || ch == '_');
+            if (accept && curLen < buf_sz - 1) {
+                buf[curLen] = (char)ch;
+                buf[curLen + 1] = '\0';
+            }
+            ch = GetCharPressed();
+        }
+        if (IsKeyPressed(KEY_BACKSPACE)) {
+            int curLen = (int)strlen(buf);
+            if (curLen > 0) buf[curLen - 1] = '\0';
+        }
+    }
+
+    if (hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        if (clicked_into) *clicked_into = true;
+    }
+}
+
+// ecran de autentificare: login + register
+void DrawLogin(void)
+{
+    draw_menu_bg();
+
+    const char *title = "ACCOUNT";
+    int titleSize = 60;
+    Vector2 tv = MeasureTextEx(gFont, title, titleSize, 2);
+    DrawTextEx(gFont, title, (Vector2){ (WIN_W - tv.x) * 0.5f, 60.0f }, titleSize, 2, WHITE);
+
+    const char *sub = "Login or register to track your rank";
+    Vector2 sv = MeasureTextEx(gFont, sub, 20, 1);
+    DrawTextEx(gFont, sub, (Vector2){ (WIN_W - sv.x) * 0.5f, 145.0f }, 20, 1, LIGHTGRAY);
+
+    float bw = 380.0f, bh = 50.0f, bx = (WIN_W - bw) * 0.5f;
+
+    // etichete + input fields
+    DrawTextEx(gFont, "Username", (Vector2){ bx, 195.0f }, 16, 1, LIGHTGRAY);
+    Rectangle inU = { bx, 220.0f, bw, bh };
+    bool clickU = false;
+    TextInput(inU, loginUser, sizeof(loginUser), "your username", false, loginFocus == 0, &clickU);
+    if (clickU) loginFocus = 0;
+
+    DrawTextEx(gFont, "Password", (Vector2){ bx, 290.0f }, 16, 1, LIGHTGRAY);
+    Rectangle inP = { bx, 315.0f, bw, bh };
+    bool clickP = false;
+    TextInput(inP, loginPass, sizeof(loginPass), "your password", true, loginFocus == 1, &clickP);
+    if (clickP) loginFocus = 1;
+
+    // TAB pentru a comuta focus
+    if (IsKeyPressed(KEY_TAB)) loginFocus = 1 - loginFocus;
+
+    // butoanele Login si Register pe acelasi rand
+    float gap = 16.0f;
+    float halfW = (bw - gap) * 0.5f;
+    Rectangle bLogin = { bx, 395.0f, halfW, bh };
+    Rectangle bReg   = { bx + halfW + gap, 395.0f, halfW, bh };
+
+    bool canSubmit = !loginBusy && loginUser[0] && loginPass[0];
+
+    bool doLogin = false, doRegister = false;
+    if (Btn(bLogin, loginBusy ? "..." : "Log In",   !canSubmit)) doLogin    = true;
+    if (Btn(bReg,   loginBusy ? "..." : "Register", !canSubmit)) doRegister = true;
+    (void)bLogin; (void)bReg;
+    // Enter ca shortcut pentru Log In
+    if (canSubmit && IsKeyPressed(KEY_ENTER)) doLogin = true;
+
+    if (doLogin) {
+        loginBusy = true;
+        char err[AUTH_ERR_MAX] = {0};
+        int ok = auth_login(loginUser, loginPass, err, sizeof(err));
+        loginBusy = false;
+        if (ok) {
+            snprintf(loginStatus, sizeof(loginStatus), "Welcome, %s!", gAuth.username);
+            loginStatusColor = (Color){ 130, 220, 130, 255 };
+            loginPass[0] = '\0';
+            // dupa login, mergi inapoi la home
+            curScreen = SCR_HOME;
+        } else {
+            snprintf(loginStatus, sizeof(loginStatus), "%s", err[0] ? err : "Login failed");
+            loginStatusColor = (Color){ 220, 80, 80, 255 };
+        }
+    }
+
+    if (doRegister) {
+        loginBusy = true;
+        char err[AUTH_ERR_MAX] = {0};
+        int ok = auth_register(loginUser, loginPass, err, sizeof(err));
+        if (ok) {
+            // dupa register, login automat
+            ok = auth_login(loginUser, loginPass, err, sizeof(err));
+        }
+        loginBusy = false;
+        if (ok) {
+            snprintf(loginStatus, sizeof(loginStatus), "Account created. Welcome, %s!", gAuth.username);
+            loginStatusColor = (Color){ 130, 220, 130, 255 };
+            loginPass[0] = '\0';
+            curScreen = SCR_HOME;
+        } else {
+            snprintf(loginStatus, sizeof(loginStatus), "%s", err[0] ? err : "Registration failed");
+            loginStatusColor = (Color){ 220, 80, 80, 255 };
+        }
+    }
+
+    // mesajul de status
+    if (loginStatus[0]) {
+        Vector2 mv = MeasureTextEx(gFont, loginStatus, 16, 1);
+        DrawTextEx(gFont, loginStatus, (Vector2){ (WIN_W - mv.x) * 0.5f, 465.0f }, 16, 1, loginStatusColor);
+    }
+
+    // server URL hint (mic, jos)
+    char hint[280];
+    snprintf(hint, sizeof(hint), "Server: %s", auth_server_url());
+    Vector2 hv = MeasureTextEx(gFont, hint, 12, 1);
+    DrawTextEx(gFont, hint, (Vector2){ (WIN_W - hv.x) * 0.5f, WIN_H - 90.0f }, 12, 1, GRAY);
+
+    // Back
+    Rectangle bBack = { bx, WIN_H - 70.0f, bw, 45 };
+    if (Btn(bBack, "Back", false)) {
+        loginStatus[0] = '\0';
+        loginPass[0] = '\0';
+        curScreen = SCR_HOME;
+    }
+}
+
+// ecran profil cu rank si statistici
+void DrawProfile(void)
+{
+    draw_menu_bg();
+
+    if (!gAuth.logged_in) {
+        // nu ar trebui sa ajungem aici, dar fallback
+        curScreen = SCR_LOGIN;
+        return;
+    }
+
+    // header cu titlu
+    const char *title = "PROFILE";
+    int titleSize = 56;
+    Vector2 tv = MeasureTextEx(gFont, title, titleSize, 2);
+    DrawTextEx(gFont, title, (Vector2){ (WIN_W - tv.x) * 0.5f, 50.0f }, titleSize, 2, WHITE);
+
+    // card mare cu username + rank
+    float cw = 560.0f, ch = 200.0f;
+    float cx = (WIN_W - cw) * 0.5f;
+    float cy = 140.0f;
+    DrawRectangleRounded((Rectangle){ cx + 3, cy + 4, cw, ch }, 0.12f, 8, (Color){0, 0, 0, 110});
+    DrawRectangleRounded((Rectangle){ cx, cy, cw, ch }, 0.12f, 8, (Color){ 40, 50, 42, 255 });
+    DrawRectangleRoundedLines((Rectangle){ cx, cy, cw, ch }, 0.12f, 8, (Color){ 90, 130, 100, 255 });
+
+    // username
+    DrawTextEx(gFont, gAuth.username, (Vector2){ cx + 30, cy + 22 }, 34, 1, WHITE);
+
+    // titlu ELO la dreapta
+    const char *rlbl = "RANK";
+    Vector2 rlv = MeasureTextEx(gFont, rlbl, 14, 2);
+    DrawTextEx(gFont, rlbl, (Vector2){ cx + cw - rlv.x - 30, cy + 18 }, 14, 2, (Color){180, 180, 180, 255});
+
+    char rankBuf[16];
+    snprintf(rankBuf, sizeof(rankBuf), "%d", gAuth.rank);
+    Vector2 rv = MeasureTextEx(gFont, rankBuf, 60, 1);
+    DrawTextEx(gFont, rankBuf, (Vector2){ cx + cw - rv.x - 30, cy + 36 }, 60, 1, GOLD);
+
+    // separator
+    DrawLine((int)(cx + 30), (int)(cy + 110), (int)(cx + cw - 30), (int)(cy + 110),
+             (Color){80, 100, 85, 255});
+
+    // statistici W/L/T
+    const char *labels[3] = { "WINS", "LOSSES", "TIES" };
+    int values[3] = { gAuth.wins, gAuth.losses, gAuth.ties };
+    Color valC[3] = {
+        (Color){130, 220, 130, 255}, (Color){220, 90, 90, 255}, (Color){200, 200, 200, 255}
+    };
+    float colW = (cw - 60) / 3.0f;
+    for (int i = 0; i < 3; i++) {
+        float colX = cx + 30 + i * colW;
+        char vbuf[16];
+        snprintf(vbuf, sizeof(vbuf), "%d", values[i]);
+        Vector2 vv = MeasureTextEx(gFont, vbuf, 36, 1);
+        DrawTextEx(gFont, vbuf, (Vector2){ colX + (colW - vv.x) * 0.5f, cy + 125 }, 36, 1, valC[i]);
+        Vector2 lv = MeasureTextEx(gFont, labels[i], 13, 2);
+        DrawTextEx(gFont, labels[i], (Vector2){ colX + (colW - lv.x) * 0.5f, cy + 168 }, 13, 2, GRAY);
+    }
+
+    // butoane jos
+    float bw = 240.0f, bh = 50.0f;
+    float byTop = cy + ch + 30;
+    float bxL = (WIN_W - (bw * 2 + 20)) * 0.5f;
+
+    Rectangle bRefresh = { bxL, byTop, bw, bh };
+    if (Btn(bRefresh, "Refresh", false)) {
+        char err[AUTH_ERR_MAX] = {0};
+        auth_refresh_profile(err, sizeof(err));
+        if (err[0]) {
+            snprintf(loginStatus, sizeof(loginStatus), "%s", err);
+            loginStatusColor = (Color){ 220, 80, 80, 255 };
+        }
+    }
+
+    Rectangle bLogout = { bxL + bw + 20, byTop, bw, bh };
+    if (Btn(bLogout, "Log Out", false)) {
+        auth_logout();
+        curScreen = SCR_HOME;
+    }
+
+    // status (eg eroare refresh)
+    if (loginStatus[0]) {
+        Vector2 mv = MeasureTextEx(gFont, loginStatus, 14, 1);
+        DrawTextEx(gFont, loginStatus, (Vector2){ (WIN_W - mv.x) * 0.5f, byTop + bh + 16 }, 14, 1, loginStatusColor);
+    }
+
+    // Back
+    Rectangle bBack = { (WIN_W - 380.0f) * 0.5f, WIN_H - 70.0f, 380.0f, 45 };
+    if (Btn(bBack, "Back to Menu", false)) {
+        loginStatus[0] = '\0';
+        curScreen = SCR_HOME;
+    }
+}
+
 //ecran de joc
 void DrawGame(void)
 {
@@ -853,9 +1555,11 @@ void DrawGame(void)
                 mpOpponentLeft = true;
                 snprintf(mpStatus, sizeof(mpStatus), "Opponent disconnected");
                 gameSt = ST_GAMEOVER;
+                mp_report_result("win");
             } else if (nm.type == NM_RESIGN) {
                 snprintf(mpStatus, sizeof(mpStatus), "Opponent resigned");
                 gameSt = ST_GAMEOVER;
+                mp_report_result("win");
             } else if (nm.type == NM_ERROR) {
                 snprintf(mpStatus, sizeof(mpStatus), "Network: %s", nm.msg);
             } else if (nm.type == NM_CLOSED) {
@@ -874,16 +1578,20 @@ void DrawGame(void)
     if (inCheck) get_king_pos(current_turn, &kingR, &kingC);
 
     //tabla
+    bool flipped = board_flipped();
 
     //umbra tablei
     DrawRectangle(BOARD_X + 4, BOARD_Y + 4, BOARD_PX, BOARD_PX, (Color){0, 0, 0, 110});
 
     for (int r = 0; r < 8; r++) {
         for (int c = 0; c < 8; c++) {
-            float x = (float)(BOARD_X + c * SQ);
-            float y = (float)(BOARD_Y + r * SQ);
+            // dr/dc = coordonatele vizuale (pe ecran), r/c = coordonatele logice (din matrice)
+            int dr = flipped ? 7 - r : r;
+            int dc = flipped ? 7 - c : c;
+            float x = (float)(BOARD_X + dc * SQ);
+            float y = (float)(BOARD_Y + dr * SQ);
 
-            //patrat de baza
+            //patrat de baza (culorile tablei depind de coordonatele logice)
             Color sq = ((r + c) % 2 == 0) ? C_LIGHT : C_DARK;
             DrawRectangle((int)x, (int)y, SQ, SQ, sq);
 
@@ -915,21 +1623,26 @@ void DrawGame(void)
     //bordura tablei
     DrawRectangleLinesEx((Rectangle){ BOARD_X, BOARD_Y, BOARD_PX, BOARD_PX }, 2, DARKGRAY);
 
-    //etichete randuri
+    //etichete randuri (inversate daca tabla e inversata)
     for (int r = 0; r < 8; r++) {
-        char lbl[2] = { (char)('0' + (8 - r)), '\0' };
+        int logicR = flipped ? 7 - r : r;
+        char lbl[2] = { (char)('0' + (8 - logicR)), '\0' };
         DrawTextEx(gFont, lbl, (Vector2){ BOARD_X - 22.0f, BOARD_Y + r * SQ + SQ * 0.5f - 9.0f }, 18, 0, LIGHTGRAY);
     }
-    //etichete coloane
+    //etichete coloane (inversate daca tabla e inversata)
     for (int c = 0; c < 8; c++) {
-        char lbl[2] = { (char)('a' + c), '\0' };
+        int logicC = flipped ? 7 - c : c;
+        char lbl[2] = { (char)('a' + logicC), '\0' };
         DrawTextEx(gFont, lbl, (Vector2){ BOARD_X + c * SQ + SQ * 0.5f - 6.0f, BOARD_Y + BOARD_PX + 8.0f }, 18, 0, LIGHTGRAY);
     }
 
-    //piese
+    //piese (pozitionate conform inversarii tablei)
     for (int r = 0; r < 8; r++)
-        for (int c = 0; c < 8; c++)
-            DrawPiece(board[r][c], (float)(BOARD_X + c * SQ), (float)(BOARD_Y + r * SQ));
+        for (int c = 0; c < 8; c++) {
+            int dr = flipped ? 7 - r : r;
+            int dc = flipped ? 7 - c : c;
+            DrawPiece(board[r][c], (float)(BOARD_X + dc * SQ), (float)(BOARD_Y + dr * SQ));
+        }
 
     //panou din dreapta
     DrawRectangle(PANEL_X - 10, PANEL_Y, PANEL_W + 10, PANEL_H, C_PANEL);
@@ -950,6 +1663,8 @@ void DrawGame(void)
         who = (current_turn == 0) ? "You (White)" : "Bot (Black)";
     else if (mpMode)
         who = (current_turn == mpMyColor) ? "Your turn" : "Opponent's turn";
+    else if (puzzleMode)
+        who = (current_turn == puzzleUserColor) ? "Your move" : "Defender";
     else
         who = (current_turn == 0) ? "White" : "Black";
     Color swFill = (current_turn == 0) ? WHITE : (Color){ 30, 30, 30, 255};
@@ -1002,6 +1717,40 @@ void DrawGame(void)
         DrawTextEx(gFont, diffLabel, (Vector2){ px + (PANEL_W - dv.x) * 0.5f - 5.0f, py }, 16, 1, LIGHTGRAY);
     }
 
+    // info multiplayer: oponent + rank (cand suntem logati)
+    if (mpMode && gameSt != ST_GAMEOVER) {
+        if (mpOpponent[0]) {
+            char oppBuf[64];
+            snprintf(oppBuf, sizeof(oppBuf), "vs %s", mpOpponent);
+            Vector2 ov = MeasureTextEx(gFont, oppBuf, 16, 1);
+            DrawTextEx(gFont, oppBuf, (Vector2){ px + (PANEL_W - ov.x) * 0.5f - 5.0f, py }, 16, 1, LIGHTGRAY);
+            py += 22.0f;
+        }
+        if (gAuth.logged_in) {
+            char rkBuf[32];
+            snprintf(rkBuf, sizeof(rkBuf), "Your rank: %d", gAuth.rank);
+            Vector2 rkv = MeasureTextEx(gFont, rkBuf, 16, 1);
+            DrawTextEx(gFont, rkBuf, (Vector2){ px + (PANEL_W - rkv.x) * 0.5f - 5.0f, py }, 16, 1, GOLD);
+            py += 22.0f;
+        }
+    }
+
+    // info puzzle: numele puzzle-ului si numarul de mutari folosite
+    if (puzzleMode && gameSt != ST_GAMEOVER) {
+        Vector2 pnv = MeasureTextEx(gFont, gPuzzles[puzzleIdx].name, 16, 1);
+        DrawTextEx(gFont, gPuzzles[puzzleIdx].name,
+                   (Vector2){ px + (PANEL_W - pnv.x) * 0.5f - 5.0f, py },
+                   16, 1, GOLD);
+        py += 24.0f;
+
+        char mvBuf[32];
+        snprintf(mvBuf, sizeof(mvBuf), "Moves: %d / %d", puzzleMoveCount, puzzleTarget);
+        Vector2 mvv = MeasureTextEx(gFont, mvBuf, 16, 1);
+        DrawTextEx(gFont, mvBuf,
+                   (Vector2){ px + (PANEL_W - mvv.x) * 0.5f - 5.0f, py },
+                   16, 1, LIGHTGRAY);
+    }
+
     // mesaj de stare multiplayer (erori de retea, etc.)
     if (mpMode && mpStatus[0] != '\0') {
         Vector2 mv = MeasureTextEx(gFont, mpStatus, 14, 1);
@@ -1022,7 +1771,11 @@ void DrawGame(void)
             net_send_resign();
             snprintf(mpStatus, sizeof(mpStatus), "You resigned");
             gameSt = ST_GAMEOVER;
+            mp_report_result("loss");
         }
+    } else if (puzzleMode) {
+        // in puzzle: dezactivam hint-ul (ar fi prea usor)
+        Btn(rHint, "Suggest Move", true);
     } else {
         // in modul local/bot: butonul de hint
         if (Btn(rHint, "Suggest Move", gameSt != ST_SELECT)) {
@@ -1037,6 +1790,17 @@ void DrawGame(void)
     if (mpMode) {
         // in multiplayer: "New Game" nu are sens, il dezactivam
         Btn(rNew, "New Game", true);
+    } else if (puzzleMode) {
+        // in puzzle: butonul reseteaza puzzle-ul curent
+        if (Btn(rNew, "Reset Puzzle", false)) {
+            load_puzzle_position(gPuzzles[puzzleIdx].setup, gPuzzles[puzzleIdx].side_to_move);
+            puzzleMoveCount = 0;
+            puzzleSolved = false;
+            puzzleFailed = false;
+            selRow = selCol = -1;
+            hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+            gameSt = ST_SELECT;
+        }
     } else {
         if (Btn(rNew,  "New Game",  false)) {
             init_board();
@@ -1051,6 +1815,9 @@ void DrawGame(void)
         if (mpMode) {
             mp_cleanup();  // inchide conexiunea de retea
         }
+        puzzleMode = 0;
+        puzzleSolved = false;
+        puzzleFailed = false;
         curScreen = SCR_HOME;
         selRow = selCol = -1;
         hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
@@ -1104,11 +1871,21 @@ void DrawGame(void)
                 current_turn = 1 - current_turn;
                 selRow = selCol = -1;
 
+                if (puzzleMode) puzzleMoveCount++;
+
                 if (!has_legal_moves(current_turn)) {
                     set_game_over();
                 } else if (mpMode) {
                     // dupa promovare in multiplayer, asteptam mutarea oponentului
                     gameSt = ST_WAIT_OPP;
+                } else if (puzzleMode) {
+                    if (puzzleMoveCount >= puzzleTarget) {
+                        puzzleFailed = true;
+                        gameSt = ST_GAMEOVER;
+                    } else {
+                        gameSt = ST_BOT_THINKING;
+                        sf_request_move();
+                    }
                 } else if (botMode && current_turn == 1) {
                     // dupa promovarea jucatorului, botul muta
                     gameSt = ST_BOT_THINKING;
@@ -1133,11 +1910,21 @@ void DrawGame(void)
         bool mate = is_in_check(current_turn);
         const char *hdr;
         const char *sub2;
+        char puzzleSubBuf[96];
 
         if (mpMode && (mpOpponentLeft || mpStatus[0] != '\0')) {
             // jocul s-a terminat din cauza deconectarii sau resign
             hdr = "GAME OVER";
             sub2 = mpStatus;
+        } else if (puzzleMode) {
+            if (puzzleSolved) {
+                hdr = "PUZZLE SOLVED";
+                snprintf(puzzleSubBuf, sizeof(puzzleSubBuf), "Mate in %d - well done!", puzzleMoveCount);
+                sub2 = puzzleSubBuf;
+            } else {
+                hdr = "PUZZLE FAILED";
+                sub2 = mate ? "You got checkmated!" : "No mate within the move limit";
+            }
         } else {
             hdr = mate ? "CHECKMATE" : "STALEMATE";
             if (mate) {
@@ -1153,7 +1940,8 @@ void DrawGame(void)
         }
 
         Vector2 hv = MeasureTextEx(gFont, hdr, 52, 2);
-        DrawTextEx(gFont, hdr, (Vector2){ dx + (dw - hv.x) * 0.5f, dy + 22 }, 52, 2, WHITE);
+        Color hdrColor = (puzzleMode && puzzleSolved) ? GOLD : WHITE;
+        DrawTextEx(gFont, hdr, (Vector2){ dx + (dw - hv.x) * 0.5f, dy + 22 }, 52, 2, hdrColor);
 
         Vector2 sv2 = MeasureTextEx(gFont, sub2, 26, 1);
         DrawTextEx(gFont, sub2, (Vector2){ dx + (dw - sv2.x) * 0.5f, dy + 92 }, 26, 1, GOLD);
@@ -1167,6 +1955,30 @@ void DrawGame(void)
                 selRow = selCol = -1;
                 hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
                 gameSt = ST_SELECT;
+            }
+        } else if (puzzleMode) {
+            // in puzzle: doua butoane - Try Again si Back to Puzzles
+            Rectangle btnRetry = { dx + 30, dy + dh - 65, 170, 44 };
+            Rectangle btnBack  = { dx + dw - 200, dy + dh - 65, 170, 44 };
+
+            if (Btn(btnRetry, "Try Again", false)) {
+                load_puzzle_position(gPuzzles[puzzleIdx].setup, gPuzzles[puzzleIdx].side_to_move);
+                puzzleMoveCount = 0;
+                puzzleSolved = false;
+                puzzleFailed = false;
+                selRow = selCol = -1;
+                hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+                gameSt = ST_SELECT;
+            }
+
+            if (Btn(btnBack, "Back to List", false)) {
+                puzzleMode = 0;
+                puzzleSolved = false;
+                puzzleFailed = false;
+                selRow = selCol = -1;
+                hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+                gameSt = ST_SELECT;
+                curScreen = SCR_PUZZLESETUP;
             }
         } else {
             Rectangle btnPA = { dx + (dw - 200) * 0.5f, dy + dh - 65, 200, 44 };
@@ -1186,10 +1998,13 @@ void DrawGame(void)
 
         // previne mutarile facute de om atunci cand este randul botului (negru)
         // in multiplayer, previne mutarile cand nu este randul nostru
+        // in puzzle, previne mutarile cand nu este culoarea jucatorului
         if (botMode && current_turn == 1) {
             // masura de precautie: click-urile sunt ignorate in acest moment
         } else if (mpMode && mpMyColor != current_turn) {
             // nu este randul nostru in multiplayer, ignoram click-urile
+        } else if (puzzleMode && puzzleUserColor != current_turn) {
+            // nu este randul nostru in puzzle (Stockfish raspunde), ignoram
         } else {
             int cr, cc; // rand curent (current row) si coloana curenta (current column) deduse din click
             if (PixToBoard(mouse, &cr, &cc)) {
@@ -1234,12 +2049,24 @@ void DrawGame(void)
                         current_turn = 1 - current_turn; // schimba randul jucatorului
                         selRow = selCol = -1; // deselecteaza
 
+                        // in puzzle mode, incrementam contorul mutarilor jucatorului
+                        if (puzzleMode) puzzleMoveCount++;
+
                         // verifica daca dupa aceasta mutare jocul s-a terminat
                         if (!has_legal_moves(current_turn)) {
                             set_game_over();
                         } else if (mpMode) {
                             // dupa mutare in multiplayer, asteptam mutarea oponentului
                             gameSt = ST_WAIT_OPP;
+                        } else if (puzzleMode) {
+                            // in puzzle: daca am atins limita de mutari fara mat, esuat
+                            if (puzzleMoveCount >= puzzleTarget) {
+                                puzzleFailed = true;
+                                gameSt = ST_GAMEOVER;
+                            } else {
+                                gameSt = ST_BOT_THINKING;
+                                sf_request_move();
+                            }
                         } else if (botMode && current_turn == 1) {
                             // daca jocul continua si e modul vs bot, incepem sa cerem mutarea botului
                             gameSt = ST_BOT_THINKING;

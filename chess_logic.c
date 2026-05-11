@@ -331,6 +331,22 @@ void execute_move(int r1, int c1, int r2, int c2, char promotion){
     }
 }
 
+// incarca o pozitie pentru puzzle: copiaza tabla, dezactiveaza rocada si en passant
+void load_puzzle_position(const char setup[8][9], int side_to_move){
+    for (int r = 0; r < 8; r++)
+        for (int c = 0; c < 8; c++)
+            board[r][c] = setup[r][c];
+
+    current_turn = (side_to_move == 1) ? 1 : 0;
+
+    // dezactivam rocada (pozitiile arbitrare nu beneficiaza de ea)
+    white_king_moved = black_king_moved = 1;
+    white_rook_a_moved = white_rook_h_moved = 1;
+    black_rook_a_moved = black_rook_h_moved = 1;
+
+    ep_target_row = ep_target_col = -1;
+}
+
 //genereaza FEN-ul pozitiei curente
 #include <stdio.h>
 void board_to_fen(char *fen, int max_len){
