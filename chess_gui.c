@@ -96,6 +96,21 @@ static int pStreak = 0;
 static bool statsLoaded = false;
 static const char *STATS_FILE = "chess_stats.txt";
 
+// stare ceas de joc: tic per cadru cand este randul jucatorului in curs
+static bool   gTimerEnabled = false;   // adevarat daca jocul are timer
+static int    gTimeInitial  = 0;       // secundele initiale
+static double gWhiteTime    = 0.0;     // timpul ramas pt alb
+static double gBlackTime    = 0.0;     // timpul ramas pt negru
+static double gLastTickT    = 0.0;     // GetTime() la ultimul cadru
+static int    gFlagged      = -1;      // -1 niciunul, 0 alb a ramas fara timp, 1 negrul
+
+// dupa selectia timpului, unde mergem?
+typedef enum {
+    TIME_NEXT_LOCAL_1V1,
+    TIME_NEXT_MP_HOST,
+} TimeNextAction;
+static TimeNextAction gTimeNext = TIME_NEXT_LOCAL_1V1;
+
 // stare ecran login: bufferele de input + focus + mesaje
 static char loginUser[AUTH_USERNAME_MAX] = "";
 static char loginPass[64] = "";
@@ -121,12 +136,14 @@ static bool puzzleSolved = false;  // true daca jucatorul a livrat sah-mat
 static bool puzzleFailed = false;  // true daca jucatorul nu a reusit sah-mat in N mutari
 
 // definitia unui puzzle: pozitie + cine muta + numarul tinta de mutari
+// difficulty: 1 = easy, 2 = medium, 3 = hard
 typedef struct {
     const char *name;
     const char *desc;
     char setup[8][9];   // 8 randuri x 8 caractere + null
     int side_to_move;   // 0 alb / 1 negru
     int target;         // sah-mat in N mutari
+    int difficulty;     // 1 easy / 2 medium / 3 hard
 } Puzzle;
 
 // colectie de puzzle-uri predefinite verificate manual
@@ -144,7 +161,7 @@ static const Puzzle gPuzzles[] = {
             "........",
             "R.....K."
         },
-        0, 1
+        0, 1, 1
     },
     {
         "Queen's Crown",
@@ -159,22 +176,7 @@ static const Puzzle gPuzzles[] = {
             "........",
             "........"
         },
-        0, 1
-    },
-    {
-        "Smothered Mate",
-        "White to move. The knight finishes the job in 1.",
-        {
-            "......rk",
-            "......pp",
-            ".......N",
-            "........",
-            "........",
-            "........",
-            "........",
-            "......K."
-        },
-        0, 1
+        0, 1, 1
     },
     {
         "Arabian Mate",
@@ -189,22 +191,97 @@ static const Puzzle gPuzzles[] = {
             "........",
             "R......."
         },
-        0, 1
+        0, 1, 1
+    },
+    {
+        "Promotion Push",
+        "White to move. Crown a pawn to deliver mate.",
+        {
+            "..k.....",
+            "P.......",
+            "..K.....",
+            "........",
+            "........",
+            "........",
+            "........",
+            "........"
+        },
+        0, 1, 1
+    },
+    {
+        "Smothered Mate",
+        "White to move. The knight finishes the job in 1.",
+        {
+            "......rk",
+            "......pp",
+            ".......N",
+            "........",
+            "........",
+            "........",
+            "........",
+            "......K."
+        },
+        0, 1, 2
+    },
+    {
+        "Anastasia's Mate",
+        "White to move. A rook lift seals the corner. Mate in 1.",
+        {
+            "........",
+            "....N.pk",
+            "........",
+            "........",
+            "........",
+            "....K...",
+            "........",
+            "R......."
+        },
+        0, 1, 2
+    },
+    {
+        "Trapped King",
+        "White to move. Take what defends the corner. Mate in 1.",
+        {
+            "........",
+            "........",
+            "........",
+            "........",
+            ".......Q",
+            "......K.",
+            ".......p",
+            ".......k"
+        },
+        0, 1, 2
+    },
+    {
+        "Double Check",
+        "White to move. A discovered double check is unstoppable.",
+        {
+            "Q.N...k.",
+            "......p.",
+            "......K.",
+            "........",
+            "........",
+            "........",
+            "........",
+            "........"
+        },
+        0, 1, 3
     },
     {
         "Pawn Crusher",
         "White to move. Corner the king with two rooks. Mate in 2.",
         {
             "k.......",
-            "p.......",
+            "pp......",
             "..K.....",
             "........",
             "........",
             "........",
             "........",
-            "RR......"
+            ".R....R."
         },
-        0, 2
+        0, 2, 3
     }
 };
 
@@ -365,6 +442,7 @@ static int start_puzzle(int idx)
     // dezactivam modurile concurente
     botMode = 0;
     mpMode = 0;
+    gTimerEnabled = false;
 
     // adancimea pentru aparare in puzzle - destul de mare pentru a apara optim
     botDepth = 14;
@@ -379,7 +457,8 @@ static int start_puzzle(int idx)
 }
 
 // porneste un joc online (din lobby cand vine 'start'). reseteaza tabla.
-static void mp_begin_game(void)
+// 'time_seconds' este timpul pentru fiecare jucator (0 = fara timer).
+static void mp_begin_game(int time_seconds)
 {
     init_board();
     current_turn = 0;
@@ -389,6 +468,14 @@ static void mp_begin_game(void)
     mpMode = 1;  // activeaza modul multiplayer
     mpOpponentLeft = false;
     mpResultReported = false;
+
+    gTimerEnabled = (time_seconds > 0);
+    gTimeInitial  = time_seconds;
+    gWhiteTime    = (double)time_seconds;
+    gBlackTime    = (double)time_seconds;
+    gLastTickT    = GetTime();
+    gFlagged      = -1;
+
     // gazda (alb) muta primul; daca eu sunt alb, sunt la rand
     gameSt = (mpMyColor == current_turn) ? ST_SELECT : ST_WAIT_OPP;
     curScreen = SCR_GAME;
@@ -797,13 +884,8 @@ void DrawHome(void)
     Rectangle b4 = { bx0 + bw + gap,   byTop + bh + gap,       bw, bh };
 
     if (BigBtn(b1, 'K', "Local 1v1", "Play side by side", false)) {
-        botMode = 0;
-        init_board();
-        current_turn = 0;
-        selRow = selCol = -1;
-        hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
-        gameSt = ST_SELECT;
-        curScreen = SCR_GAME;
+        gTimeNext = TIME_NEXT_LOCAL_1V1;
+        curScreen = SCR_TIMESETUP;
     }
 
     if (BigBtn(b2, 'n', "Play vs Bot", "Easy / Medium / Hard", false)) {
@@ -819,8 +901,13 @@ void DrawHome(void)
         }
     }
 
-    if (BigBtn(b4, 'Q', "Puzzles", "Solve checkmate puzzles", false)) {
-        curScreen = SCR_PUZZLESETUP;
+    {
+        bool sfOk = FileExists(SF_PATH);
+        if (BigBtn(b4, 'Q', "Puzzles", sfOk ? "Solve checkmate puzzles" : "Stockfish not found!", !sfOk)) {
+            // porneste direct un puzzle aleator (fara meniul de selectie)
+            int idx = GetRandomValue(0, gPuzzleCount - 1);
+            start_puzzle(idx);
+        }
     }
 
     // === statistici jos ===
@@ -922,6 +1009,7 @@ void DrawBotSetup(void)
     if (Btn(b1, "Easy", !sfExists)) {
         botDepth = 1;
         botMode = 1;
+        gTimerEnabled = false;
         if (sf_start()) {
             init_board();
             current_turn = 0;
@@ -937,6 +1025,7 @@ void DrawBotSetup(void)
     if (Btn(b2, "Medium", !sfExists)) {
         botDepth = 5;
         botMode = 1;
+        gTimerEnabled = false;
         if (sf_start()) {
             init_board();
             current_turn = 0;
@@ -952,6 +1041,7 @@ void DrawBotSetup(void)
     if (Btn(b3, "Hard", !sfExists)) {
         botDepth = 12;
         botMode = 1;
+        gTimerEnabled = false;
         if (sf_start()) {
             init_board();
             current_turn = 0;
@@ -1004,7 +1094,7 @@ static void mp_drain_menu_messages(void)
         } else if (m.type == NM_START) {
             if (m.opponent[0])
                 snprintf(mpOpponent, sizeof(mpOpponent), "%s", m.opponent);
-            mp_begin_game();
+            mp_begin_game(m.time_seconds);
         } else if (m.type == NM_ERROR) {
             snprintf(mpStatus, sizeof(mpStatus), "Error: %s", m.msg);
         } else if (m.type == NM_OPP_LEFT || m.type == NM_CLOSED) {
@@ -1038,16 +1128,9 @@ void DrawMpSetup(void)
     Rectangle bHost = { bx, 200, bw, bh };
     bool hosting = mpHosting;  // dezactivat in timp ce asteptam codul
     if (Btn(bHost, hosting ? "Connecting..." : "Host New Game", hosting)) {
-        if (!net_running()) {
-            if (!net_start(NULL)) {
-                snprintf(mpStatus, sizeof(mpStatus), "Could not start network bridge");
-            }
-        }
-        if (net_running()) {
-            mpHosting = true;
-            net_send_create(gAuth.logged_in ? gAuth.username : NULL);
-            mpStatus[0] = '\0';
-        }
+        // gazda alege ceasul inainte de a deschide camera
+        gTimeNext = TIME_NEXT_MP_HOST;
+        curScreen = SCR_TIMESETUP;
     }
 
     // sectiunea JOIN
@@ -1138,10 +1221,12 @@ void DrawMpLobby(void)
     Vector2 sv = MeasureTextEx(gFont, sub, 22, 1);
     DrawTextEx(gFont, sub, (Vector2){ (WIN_W - sv.x) * 0.5f, 175.0f }, 22, 1, LIGHTGRAY);
 
-    // afiseaza codul mare si centrat
-    Vector2 cv = MeasureTextEx(gFont, mpRoomCode, 110, 6);
-    DrawTextEx(gFont, mpRoomCode,
-               (Vector2){ (WIN_W - cv.x) * 0.5f, 230.0f }, 110, 6, GOLD);
+    // afiseaza codul mare si centrat (sau "creating..." daca inca asteptam)
+    const char *codeShown = mpRoomCode[0] ? mpRoomCode : "----";
+    Vector2 cv = MeasureTextEx(gFont, codeShown, 110, 6);
+    DrawTextEx(gFont, codeShown,
+               (Vector2){ (WIN_W - cv.x) * 0.5f, 230.0f }, 110, 6,
+               mpRoomCode[0] ? GOLD : DARKGRAY);
 
     // animatie cu puncte
     int dots = ((int)(GetTime() * 3.0)) % 4;
@@ -1507,11 +1592,159 @@ void DrawProfile(void)
     }
 }
 
+// porneste un joc local 1v1 cu un timer dat (in secunde, 0 = fara timer)
+static void start_local_1v1(int time_seconds)
+{
+    botMode = 0;
+    mpMode = 0;
+    puzzleMode = 0;
+    init_board();
+    current_turn = 0;
+    selRow = selCol = -1;
+    hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+    gameSt = ST_SELECT;
+
+    gTimerEnabled = (time_seconds > 0);
+    gTimeInitial  = time_seconds;
+    gWhiteTime    = (double)time_seconds;
+    gBlackTime    = (double)time_seconds;
+    gLastTickT    = GetTime();
+    gFlagged      = -1;
+
+    curScreen = SCR_GAME;
+}
+
+// ecran de alegere a ceasului (1 / 5 / 10 minute) — folosit atat pentru 1v1
+// cat si pentru gazda multiplayer.
+void DrawTimeSetup(void)
+{
+    draw_menu_bg();
+
+    const char *title = "PICK A TIME CONTROL";
+    int titleSize = 50;
+    Vector2 tv = MeasureTextEx(gFont, title, titleSize, 2);
+    DrawTextEx(gFont, title, (Vector2){ (WIN_W - tv.x) * 0.5f, 70.0f }, titleSize, 2, WHITE);
+
+    const char *sub = (gTimeNext == TIME_NEXT_MP_HOST)
+        ? "The guest will play with your choice"
+        : "How long does each side get on the clock?";
+    Vector2 sv = MeasureTextEx(gFont, sub, 20, 1);
+    DrawTextEx(gFont, sub, (Vector2){ (WIN_W - sv.x) * 0.5f, 150.0f }, 20, 1, LIGHTGRAY);
+
+    static const int times[3]      = { 60, 300, 600 };
+    static const char *labels[3]   = { "1 min", "5 min", "10 min" };
+    static const char *blurbs[3]   = { "Bullet — fast and chaotic",
+                                       "Blitz — the classic",
+                                       "Rapid — time to think" };
+
+    float bw = 420.0f, bh = 90.0f, gap = 18.0f;
+    float bx = (WIN_W - bw) * 0.5f;
+    float byTop = 220.0f;
+
+    Vector2 mouse = GetMousePosition();
+
+    for (int i = 0; i < 3; i++) {
+        Rectangle r = { bx, byTop + i * (bh + gap), bw, bh };
+        bool hov = CheckCollisionPointRec(mouse, r);
+
+        DrawRectangleRounded((Rectangle){ r.x + 2, r.y + 3, r.width, r.height }, 0.18f, 8, (Color){0, 0, 0, 110});
+        Color bg = hov ? C_BTN_HOV : C_BTN;
+        Color border = hov ? LIME : GREEN;
+        DrawRectangleRounded(r, 0.18f, 8, bg);
+        DrawRectangleRoundedLines(r, 0.18f, 8, border);
+
+        // icon ceas (cerc cu cruce subtila)
+        DrawCircle((int)(r.x + 50), (int)(r.y + r.height * 0.5f), 24, (Color){25, 30, 26, 255});
+        DrawCircleLines((int)(r.x + 50), (int)(r.y + r.height * 0.5f), 24, GOLD);
+        // ace
+        DrawLineEx((Vector2){ r.x + 50, r.y + r.height * 0.5f },
+                   (Vector2){ r.x + 50, r.y + r.height * 0.5f - 14 }, 2.0f, GOLD);
+        DrawLineEx((Vector2){ r.x + 50, r.y + r.height * 0.5f },
+                   (Vector2){ r.x + 50 + 10, r.y + r.height * 0.5f }, 2.0f, GOLD);
+
+        // labels
+        DrawTextEx(gFont, labels[i], (Vector2){ r.x + 100, r.y + 20 }, 30, 1, WHITE);
+        DrawTextEx(gFont, blurbs[i], (Vector2){ r.x + 100, r.y + 56 }, 16, 1,
+                   (Color){200, 220, 200, 230});
+
+        if (hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            int secs = times[i];
+            if (gTimeNext == TIME_NEXT_LOCAL_1V1) {
+                start_local_1v1(secs);
+            } else {
+                // multiplayer host: porneste podul si trimite create cu timpul ales
+                if (!net_running()) {
+                    if (!net_start(NULL)) {
+                        snprintf(mpStatus, sizeof(mpStatus), "Could not start network bridge");
+                        curScreen = SCR_MPSETUP;
+                        return;
+                    }
+                }
+                if (net_running()) {
+                    mpHosting = true;
+                    net_send_create(gAuth.logged_in ? gAuth.username : NULL, secs);
+                    mpStatus[0] = '\0';
+                    curScreen = SCR_MPLOBBY;
+                }
+            }
+        }
+    }
+
+    // Back
+    Rectangle bBack = { bx, WIN_H - 70.0f, bw, 45 };
+    if (Btn(bBack, "Back", false)) {
+        curScreen = (gTimeNext == TIME_NEXT_MP_HOST) ? SCR_MPSETUP : SCR_HOME;
+    }
+}
+
 //ecran de joc
 void DrawGame(void)
 {
     ClearBackground(C_BG);
     Vector2 mouse = GetMousePosition();
+
+    /* ── timer: decrementeaza ceasul jucatorului activ ── */
+    double now = GetTime();
+    if (gTimerEnabled) {
+        double dt = now - gLastTickT;
+        if (dt < 0) dt = 0;
+        // ticaim doar in starile in care ceasul ruleaza efectiv
+        bool ticking = (gameSt == ST_SELECT || gameSt == ST_WAIT_OPP);
+        if (ticking) {
+            if (current_turn == 0) gWhiteTime -= dt;
+            else                   gBlackTime -= dt;
+        }
+
+        // detecteaza timeout
+        if (gameSt != ST_GAMEOVER) {
+            if (gWhiteTime <= 0.0 || gBlackTime <= 0.0) {
+                if (gWhiteTime <= 0.0) gWhiteTime = 0.0;
+                if (gBlackTime <= 0.0) gBlackTime = 0.0;
+                int flagged = (gWhiteTime <= 0.0) ? 0 : 1;
+                gFlagged = flagged;
+                if (mpMode) {
+                    // jucatorul ramas fara timp pierde; daca e culoarea noastra,
+                    // anuntam serverul printr-un mesaj de resign
+                    if (flagged == mpMyColor) {
+                        net_send_resign();
+                        mp_report_result("loss");
+                    } else {
+                        mp_report_result("win");
+                    }
+                    snprintf(mpStatus, sizeof(mpStatus),
+                             "Time out — %s wins", (flagged == 0) ? "Black" : "White");
+                } else if (botMode) {
+                    // botMode nu foloseste timer in mod normal, dar in caz ca cineva
+                    // l-ar activa: tratam ca pierdere/castig dupa care a pierdut timpul
+                    if (flagged == 0) { pLosses++; pStreak = 0; }
+                    else              { pWins++;   pStreak++;  }
+                    save_stats();
+                }
+                gameSt = ST_GAMEOVER;
+            }
+        }
+    }
+    gLastTickT = now;
 
     /* ── bot: polling pentru bestmove ── */
     if (gameSt == ST_BOT_THINKING && sf_poll_move()) {
@@ -1651,6 +1884,48 @@ void DrawGame(void)
     float px = (float)(PANEL_X + 5);
     float py = (float)(PANEL_Y + 18);
 
+    // ── ceasuri (afisate doar daca jocul are timer) ──
+    if (gTimerEnabled) {
+        float clockW = PANEL_W - 20.0f;
+        float clockH = 56.0f;
+        // negrul sus, albul jos (urmeaza orientarea tablei)
+        for (int side = 0; side < 2; side++) {
+            int color = (side == 0) ? 1 : 0;  // 0 = negru desenat sus, 1 = alb desenat jos
+            double remaining = (color == 0) ? gWhiteTime : gBlackTime;
+            bool active = (current_turn == color) && (gameSt != ST_GAMEOVER);
+            bool low = remaining <= 10.0;
+
+            float cy2 = py + side * (clockH + 6.0f);
+            Rectangle cr = { px, cy2, clockW, clockH };
+            Color bg = active ? (low ? (Color){80, 30, 30, 255} : (Color){38, 70, 50, 255})
+                              : (Color){30, 30, 30, 255};
+            Color brd = active ? (low ? (Color){220, 70, 70, 255} : LIME)
+                               : (Color){70, 70, 70, 255};
+            DrawRectangleRounded(cr, 0.22f, 8, bg);
+            DrawRectangleRoundedLines(cr, 0.22f, 8, brd);
+
+            // disc indicator de culoare
+            Color disc = (color == 0) ? WHITE : (Color){25, 25, 25, 255};
+            DrawCircle((int)(px + 22), (int)(cy2 + clockH * 0.5f), 13, LIGHTGRAY);
+            DrawCircle((int)(px + 22), (int)(cy2 + clockH * 0.5f), 10, disc);
+
+            // timpul ramas
+            int total = (int)(remaining + 0.5);
+            if (total < 0) total = 0;
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d:%02d", total / 60, total % 60);
+            Vector2 tv2 = MeasureTextEx(gFont, buf, 32, 1);
+            DrawTextEx(gFont, buf,
+                       (Vector2){ px + clockW - tv2.x - 16, cy2 + (clockH - tv2.y) * 0.5f },
+                       32, 1, low && active ? (Color){255, 200, 200, 255} : WHITE);
+        }
+        py += 2 * 56.0f + 6.0f + 14.0f;
+
+        // separator
+        DrawLine((int)px, (int)py, (int)(px + PANEL_W - 20), (int)py, DARKGRAY);
+        py += 12.0f;
+    }
+
     //eticheta "turn"
     const char *turnLbl = "TURN";
     Vector2 tlv = MeasureTextEx(gFont, turnLbl, 14, 2);
@@ -1735,13 +2010,28 @@ void DrawGame(void)
         }
     }
 
-    // info puzzle: numele puzzle-ului si numarul de mutari folosite
+    // info puzzle: numele puzzle-ului, dificultatea si numarul de mutari folosite
     if (puzzleMode && gameSt != ST_GAMEOVER) {
         Vector2 pnv = MeasureTextEx(gFont, gPuzzles[puzzleIdx].name, 16, 1);
         DrawTextEx(gFont, gPuzzles[puzzleIdx].name,
                    (Vector2){ px + (PANEL_W - pnv.x) * 0.5f - 5.0f, py },
                    16, 1, GOLD);
-        py += 24.0f;
+        py += 22.0f;
+
+        // eticheta de dificultate cu culoare corespunzatoare
+        const char *diffLabel;
+        Color diffColor;
+        int diff = gPuzzles[puzzleIdx].difficulty;
+        if (diff <= 1)      { diffLabel = "Easy";   diffColor = (Color){100, 220, 100, 255}; }
+        else if (diff == 2) { diffLabel = "Medium"; diffColor = (Color){240, 200, 60, 255};  }
+        else                { diffLabel = "Hard";   diffColor = (Color){220, 80, 80, 255};   }
+        char diffBuf[32];
+        snprintf(diffBuf, sizeof(diffBuf), "Difficulty: %s", diffLabel);
+        Vector2 dv2 = MeasureTextEx(gFont, diffBuf, 14, 1);
+        DrawTextEx(gFont, diffBuf,
+                   (Vector2){ px + (PANEL_W - dv2.x) * 0.5f - 5.0f, py },
+                   14, 1, diffColor);
+        py += 22.0f;
 
         char mvBuf[32];
         snprintf(mvBuf, sizeof(mvBuf), "Moves: %d / %d", puzzleMoveCount, puzzleTarget);
@@ -1774,8 +2064,15 @@ void DrawGame(void)
             mp_report_result("loss");
         }
     } else if (puzzleMode) {
-        // in puzzle: dezactivam hint-ul (ar fi prea usor)
-        Btn(rHint, "Suggest Move", true);
+        // in puzzle: buton "Skip Puzzle" care incarca un alt puzzle aleator
+        if (Btn(rHint, "Skip Puzzle", false)) {
+            int newIdx = puzzleIdx;
+            if (gPuzzleCount > 1) {
+                while (newIdx == puzzleIdx)
+                    newIdx = GetRandomValue(0, gPuzzleCount - 1);
+            }
+            start_puzzle(newIdx);
+        }
     } else {
         // in modul local/bot: butonul de hint
         if (Btn(rHint, "Suggest Move", gameSt != ST_SELECT)) {
@@ -1808,6 +2105,11 @@ void DrawGame(void)
             selRow = selCol = -1;
             hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
             gameSt = ST_SELECT;
+            // re-armam ceasul daca jocul curent il foloseste
+            if (gTimerEnabled) {
+                gWhiteTime = gBlackTime = (double)gTimeInitial;
+                gLastTickT = GetTime();
+            }
         }
     }
 
@@ -1925,6 +2227,16 @@ void DrawGame(void)
                 hdr = "PUZZLE FAILED";
                 sub2 = mate ? "You got checkmated!" : "No mate within the move limit";
             }
+        } else if (gFlagged >= 0) {
+            // partida s-a incheiat prin epuizarea timpului
+            hdr = "TIME UP";
+            int winner = 1 - gFlagged;
+            if (mpMode)
+                sub2 = (winner == mpMyColor) ? "You win on time!" : "You lose on time";
+            else if (botMode)
+                sub2 = (winner == 0) ? "You win on time!" : "Bot wins on time";
+            else
+                sub2 = (winner == 0) ? "White wins on time" : "Black wins on time";
         } else {
             hdr = mate ? "CHECKMATE" : "STALEMATE";
             if (mate) {
@@ -1971,14 +2283,14 @@ void DrawGame(void)
                 gameSt = ST_SELECT;
             }
 
-            if (Btn(btnBack, "Back to List", false)) {
-                puzzleMode = 0;
-                puzzleSolved = false;
-                puzzleFailed = false;
-                selRow = selCol = -1;
-                hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
-                gameSt = ST_SELECT;
-                curScreen = SCR_PUZZLESETUP;
+            if (Btn(btnBack, "Next Puzzle", false)) {
+                // incarca un alt puzzle aleator (evita repetarea celui curent)
+                int newIdx = puzzleIdx;
+                if (gPuzzleCount > 1) {
+                    while (newIdx == puzzleIdx)
+                        newIdx = GetRandomValue(0, gPuzzleCount - 1);
+                }
+                start_puzzle(newIdx);
             }
         } else {
             Rectangle btnPA = { dx + (dw - 200) * 0.5f, dy + dh - 65, 200, 44 };

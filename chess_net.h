@@ -25,6 +25,7 @@ typedef struct {
     char uci[8];       // mutare uci (ex "e2e4" sau "e7e8q")
     char msg[160];     // mesaj de eroare
     char opponent[32]; // username-ul oponentului (pentru ranking)
+    int  time_seconds; // timpul de joc (in secunde, 0 = fara timer)
 } NetMsg;
 
 // porneste procesul bridge si stabileste conexiunea WS catre 'url'
@@ -39,7 +40,8 @@ void net_stop(void);
 int net_running(void);
 
 // trimite cereri tipice catre server. 'username' poate fi NULL pentru a juca ca invitat.
-void net_send_create(const char *username);
+// 'time_seconds' este timpul pe ceas pentru fiecare jucator (0 = fara timer).
+void net_send_create(const char *username, int time_seconds);
 void net_send_join(const char *code, const char *username);
 void net_send_move(const char *uci);
 void net_send_resign(void);

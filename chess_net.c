@@ -123,15 +123,19 @@ static void sanitize_username(const char *src, char *dst, int dst_sz)
     dst[j] = '\0';
 }
 
-void net_send_create(const char *username)
+void net_send_create(const char *username, int time_seconds)
 {
     char ubuf[24] = {0};
     sanitize_username(username, ubuf, sizeof(ubuf));
-    char buf[96];
+    if (time_seconds < 0) time_seconds = 0;
+    char buf[128];
     if (ubuf[0])
-        snprintf(buf, sizeof(buf), "{\"type\":\"create\",\"username\":\"%s\"}\n", ubuf);
+        snprintf(buf, sizeof(buf),
+                 "{\"type\":\"create\",\"username\":\"%s\",\"time\":%d}\n",
+                 ubuf, time_seconds);
     else
-        snprintf(buf, sizeof(buf), "{\"type\":\"create\"}\n");
+        snprintf(buf, sizeof(buf),
+                 "{\"type\":\"create\",\"time\":%d}\n", time_seconds);
     send_line(buf);
 }
 
@@ -233,6 +237,16 @@ static int parse_line(const char *line, NetMsg *out)
     json_get_str(line, "uci",      out->uci,      sizeof(out->uci));
     json_get_str(line, "msg",      out->msg,      sizeof(out->msg));
     json_get_str(line, "opponent", out->opponent, sizeof(out->opponent));
+
+    // parseaza timpul (intreg, "time":300)
+    const char *tp = strstr(line, "\"time\"");
+    if (tp) {
+        tp += 6;
+        while (*tp == ' ' || *tp == '\t' || *tp == ':') tp++;
+        if (*tp == '-' || (*tp >= '0' && *tp <= '9')) {
+            out->time_seconds = (int)strtol(tp, NULL, 10);
+        }
+    }
     return 1;
 }
 

@@ -36,6 +36,8 @@ int main(void)
             DrawLogin();
         else if (curScreen == SCR_PROFILE)
             DrawProfile();
+        else if (curScreen == SCR_TIMESETUP)
+            DrawTimeSetup();
         else
             DrawGame();
 

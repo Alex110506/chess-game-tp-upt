@@ -339,6 +339,7 @@ class Room:
     guest:  Optional[WebSocket] = None
     host_user:  Optional[str] = None
     guest_user: Optional[str] = None
+    time_seconds: int = 0           # 0 = no timer; else initial seconds per side
     lock:   asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -394,12 +395,18 @@ async def ws_endpoint(ws: WebSocket):
                 if my_room is not None:
                     await _send(ws, {"type": "error", "msg": "already in room"})
                     continue
+                # accept timer choice from host (in seconds); clamp to sane range
+                req_time = int(msg.get("time") or 0)
+                if req_time < 0 or req_time > 3 * 3600:
+                    req_time = 0
                 async with rooms_lock:
                     code = _new_code()
-                    room = Room(code=code, host=ws, host_user=msg.get("username"))
+                    room = Room(code=code, host=ws, host_user=msg.get("username"),
+                                time_seconds=req_time)
                     rooms[code] = room
                 my_room = room
-                await _send(ws, {"type": "created", "code": code, "color": "white"})
+                await _send(ws, {"type": "created", "code": code, "color": "white",
+                                 "time": req_time})
 
             elif mtype == "join":
                 if my_room is not None:
@@ -422,9 +429,14 @@ async def ws_endpoint(ws: WebSocket):
                     "code": code,
                     "color": "black",
                     "opponent": room.host_user or "",
+                    "time":     room.time_seconds,
                 })
-                await _send(room.host, {"type": "start", "opponent": room.guest_user or ""})
-                await _send(ws,        {"type": "start", "opponent": room.host_user or ""})
+                await _send(room.host, {"type": "start",
+                                        "opponent": room.guest_user or "",
+                                        "time":     room.time_seconds})
+                await _send(ws,        {"type": "start",
+                                        "opponent": room.host_user or "",
+                                        "time":     room.time_seconds})
 
             elif mtype in ("move", "resign"):
                 if my_room is None:

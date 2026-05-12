@@ -16,6 +16,7 @@ typedef enum {
     SCR_PUZZLESETUP, // alegerea unui puzzle "checkmate in N"
     SCR_LOGIN,      // ecran de autentificare/inregistrare
     SCR_PROFILE,    // profilul jucatorului (stats si rank)
+    SCR_TIMESETUP,  // alegerea ceasului (1/5/10 min) pentru 1v1 si host MP
     SCR_GAME
 } Screen;
 
@@ -34,6 +35,7 @@ void DrawMpLobby(void);
 void DrawPuzzleSetup(void);
 void DrawLogin(void);
 void DrawProfile(void);
+void DrawTimeSetup(void);
 void DrawGame(void);
 
 // opreste procesul motorului de sah (Stockfish) in caz de iesire
