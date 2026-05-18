@@ -1,1 +1,8 @@
 /stockfish
+
+/chess
+/chess_gui
+*.o
+
+chess_session.txt
+chess_stats.txt
