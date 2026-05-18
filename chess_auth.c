@@ -234,6 +234,9 @@ static void apply_profile(const char *body)
     if (json_get_int(body, "losses", &v)) gAuth.losses = v;
     if (json_get_int(body, "ties",   &v)) gAuth.ties   = v;
     if (json_get_int(body, "rank",   &v)) gAuth.rank   = v;
+    char sub[16] = {0};
+    if (json_get_str(body, "subscription", sub, sizeof(sub)) && sub[0])
+        snprintf(gAuth.subscription, sizeof(gAuth.subscription), "%s", sub);
 }
 
 // ---------------------------------------------------------------------------
@@ -426,5 +429,6 @@ void auth_clear_session(void)
     gAuth.token[0] = '\0';
     gAuth.wins = gAuth.losses = gAuth.ties = 0;
     gAuth.rank = 0;
+    gAuth.subscription[0] = '\0';
     remove(session_file_path());
 }

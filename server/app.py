@@ -46,7 +46,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+import stripe
+from stripe._error import SignatureVerificationError as StripeSignatureError
+
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
@@ -64,6 +68,14 @@ except Exception:
 
 MONGODB_URI = os.environ.get("MONGODB_URI", "")
 MONGODB_DB = os.environ.get("MONGODB_DB", "chess")
+
+STRIPE_SECRET_KEY    = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_PRICE_ID      = os.environ.get("STRIPE_PRICE_ID", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+FRONTEND_URL         = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 DEFAULT_RANK = 1200      # ELO start for new accounts
 ELO_K = 32               # update sensitivity
@@ -158,6 +170,14 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title="Chess Multiplayer + Ranking", lifespan=_lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_URL],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ---------------------------------------------------------------------------
 # Profile helpers
@@ -165,11 +185,13 @@ app = FastAPI(title="Chess Multiplayer + Ranking", lifespan=_lifespan)
 
 def _profile(doc: dict) -> dict:
     return {
-        "username": doc["username"],
-        "wins":     doc.get("wins", 0),
-        "losses":   doc.get("losses", 0),
-        "ties":     doc.get("ties", 0),
-        "rank":     doc.get("rank", DEFAULT_RANK),
+        "username":     doc["username"],
+        "wins":         doc.get("wins", 0),
+        "losses":       doc.get("losses", 0),
+        "ties":         doc.get("ties", 0),
+        "rank":         doc.get("rank", DEFAULT_RANK),
+        # "free" | "pro" | "cancelling"
+        "subscription": doc.get("subscription", "free"),
     }
 
 
@@ -203,14 +225,17 @@ async def auth_register(body: AuthIn):
 
     pw_hash, salt = hash_password(body.password)
     doc = {
-        "username":      body.username,
-        "password_hash": pw_hash,
-        "salt":          salt,
-        "wins":          0,
-        "losses":        0,
-        "ties":          0,
-        "rank":          DEFAULT_RANK,
-        "token":         None,
+        "username":               body.username,
+        "password_hash":          pw_hash,
+        "salt":                   salt,
+        "wins":                   0,
+        "losses":                 0,
+        "ties":                   0,
+        "rank":                   DEFAULT_RANK,
+        "token":                  None,
+        "subscription":           "free",
+        "stripe_customer_id":     None,
+        "stripe_subscription_id": None,
     }
     # _users() raises HTTPException(503) if MONGODB_URI is missing — let it
     # propagate so the client sees a real status. Only the duplicate-key
@@ -326,6 +351,95 @@ async def root():
         "rooms": len(rooms),
         "auth": bool(MONGODB_URI),
     }
+
+
+# ---------------------------------------------------------------------------
+# Stripe checkout
+# ---------------------------------------------------------------------------
+
+@app.post("/stripe/create-checkout-session")
+async def create_checkout_session(authorization: Optional[str] = Header(None)):
+    doc = await _user_by_token(authorization)
+    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
+        raise HTTPException(503, "Stripe not configured (set STRIPE_SECRET_KEY and STRIPE_PRICE_ID)")
+    if doc.get("subscription") == "pro":
+        raise HTTPException(400, "Already subscribed")
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        client_reference_id=doc["username"],
+        success_url=f"{FRONTEND_URL}/account?checkout=success",
+        cancel_url=f"{FRONTEND_URL}/account?checkout=cancel",
+    )
+    return {"url": session.url}
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(503, "Webhook secret not configured (set STRIPE_WEBHOOK_SECRET)")
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+    try:
+        stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, StripeSignatureError):
+        raise HTTPException(400, "Invalid Stripe webhook payload or signature")
+
+    # Stripe SDK v5 returns typed objects — convert to plain dict for safe access
+    try:
+        raw = json.loads(payload)
+        event_type: str = raw["type"]
+        data: dict      = raw["data"]["object"]
+    except Exception as exc:
+        print(f"[webhook] failed to parse payload: {exc}")
+        raise HTTPException(400, "Malformed event payload")
+
+    print(f"[webhook] {event_type}")
+
+    try:
+        if event_type == "checkout.session.completed":
+            username        = data.get("client_reference_id")
+            customer_id     = data.get("customer")
+            subscription_id = data.get("subscription")
+            print(f"[webhook] checkout completed — user={username} customer={customer_id} sub={subscription_id}")
+            if username:
+                upd = {"subscription": "pro"}
+                if customer_id:
+                    upd["stripe_customer_id"] = customer_id
+                if subscription_id:
+                    upd["stripe_subscription_id"] = subscription_id
+                await _users().update_one({"username": username}, {"$set": upd})
+
+        elif event_type in ("customer.subscription.deleted", "customer.subscription.paused"):
+            customer_id = data.get("customer")
+            if customer_id:
+                await _users().update_one(
+                    {"stripe_customer_id": customer_id},
+                    {"$set": {"subscription": "free", "stripe_subscription_id": None}},
+                )
+    except Exception as exc:
+        print(f"[webhook] error handling {event_type}: {exc}")
+        raise HTTPException(500, "Internal error processing webhook")
+
+    return {"ok": True}
+
+
+@app.post("/stripe/cancel-subscription")
+async def cancel_subscription(authorization: Optional[str] = Header(None)):
+    doc = await _user_by_token(authorization)
+    if doc.get("subscription") != "pro":
+        raise HTTPException(400, "No active subscription to cancel")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Stripe not configured")
+    sub_id = doc.get("stripe_subscription_id")
+    if not sub_id:
+        raise HTTPException(500, "Subscription ID not found — contact support")
+    stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
+    await _users().update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"subscription": "cancelling"}},
+    )
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

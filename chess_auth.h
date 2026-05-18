@@ -22,6 +22,7 @@ typedef struct {
     int  losses;
     int  ties;
     int  rank;
+    char subscription[16]; // "free" | "pro" | "cancelling"
 } AuthState;
 
 extern AuthState gAuth;

@@ -8,6 +8,7 @@
 #define WIN_H 680
 
 // starea ecranului curent din joc
+
 typedef enum {
     SCR_HOME,
     SCR_BOTSETUP,

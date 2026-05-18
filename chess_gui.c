@@ -722,6 +722,52 @@ static bool Btn(Rectangle r, const char *txt, bool dis)
     return hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
 }
 
+// buton cu accent auriu (folosit pentru actiuni legate de abonament)
+static bool BtnGold(Rectangle r, const char *txt, bool dis)
+{
+    Vector2 mouse = GetMousePosition();
+    bool hov = !dis && CheckCollisionPointRec(mouse, r);
+    Color bg     = dis ? C_BTN_DIS : (hov ? (Color){ 210, 165, 20, 255 } : (Color){ 170, 130, 10, 255 });
+    Color border = dis ? DARKGRAY  : (hov ? WHITE : GOLD);
+
+    DrawRectangleRounded(r, 0.25f, 8, bg);
+    DrawRectangleRoundedLines(r, 0.25f, 8, border);
+
+    Vector2 ts = MeasureTextEx(gFont, txt, 20, 1);
+    DrawTextEx(gFont, txt,
+               (Vector2){ r.x + (r.width  - ts.x) * 0.5f,
+                          r.y + (r.height - ts.y) * 0.5f },
+               20, 1, dis ? GRAY : (Color){ 20, 14, 0, 255 });
+
+    return hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+}
+
+// deschide un URL in browser-ul implicit al sistemului
+static void open_in_browser(const char *url)
+{
+    char cmd[512];
+#if defined(__APPLE__)
+    snprintf(cmd, sizeof(cmd), "open \"%s\"", url);
+#elif defined(_WIN32)
+    snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", url);
+#else
+    snprintf(cmd, sizeof(cmd), "xdg-open \"%s\"", url);
+#endif
+    system(cmd);
+}
+
+// returneaza URL-ul frontend-ului web (configurabil prin CHESS_FRONTEND_URL)
+static const char *frontend_url(void)
+{
+    static char g_frontend_url[256] = {0};
+    if (!g_frontend_url[0]) {
+        const char *env = getenv("CHESS_FRONTEND_URL");
+        snprintf(g_frontend_url, sizeof(g_frontend_url), "%s",
+                 (env && *env) ? env : "http://localhost:5173");
+    }
+    return g_frontend_url;
+}
+
 // deseneaza o piesa centrata la (cx, cy) cu raza data
 static void DrawPieceAt(char p, float cx, float cy, float rad)
 {
@@ -826,6 +872,20 @@ void DrawHome(void)
             char rkbuf[24];
             snprintf(rkbuf, sizeof(rkbuf), "Rank %d", gAuth.rank);
             DrawTextEx(gFont, rkbuf, (Vector2){ pbX + 44, pbY + 24 }, 14, 1, GOLD);
+
+            // badge PRO (sus-dreapta) daca abonamentul este activ
+            bool hasPro = strcmp(gAuth.subscription, "pro")        == 0
+                       || strcmp(gAuth.subscription, "cancelling") == 0;
+            if (hasPro) {
+                const char *proLbl = "PRO";
+                Vector2 plv = MeasureTextEx(gFont, proLbl, 11, 1);
+                float bpx = pbX + pbW - plv.x - 16.0f;
+                float bpy = pbY + 5.0f;
+                DrawRectangleRounded((Rectangle){ bpx - 5, bpy - 2, plv.x + 10, plv.y + 4 },
+                                     0.6f, 8, GOLD);
+                DrawTextEx(gFont, proLbl, (Vector2){ bpx, bpy }, 11, 1,
+                           (Color){ 30, 20, 0, 255 });
+            }
         } else {
             DrawTextEx(gFont, "Sign in", (Vector2){ pbX + 44, pbY + 6 }, 18, 1, WHITE);
             DrawTextEx(gFont, "to track rank", (Vector2){ pbX + 44, pbY + 24 }, 12, 1,
@@ -1557,9 +1617,60 @@ void DrawProfile(void)
         DrawTextEx(gFont, labels[i], (Vector2){ colX + (colW - lv.x) * 0.5f, cy + 168 }, 13, 2, GRAY);
     }
 
+    // === card abonament ===
+    float scy = cy + ch + 14.0f;
+    float scw = cw, sch = 90.0f;
+    float scx = cx;
+
+    bool subPro        = strcmp(gAuth.subscription, "pro")        == 0;
+    bool subCancelling = strcmp(gAuth.subscription, "cancelling") == 0;
+
+    Color scBorder = subPro        ? (Color){ 200, 160, 40, 255 } :
+                     subCancelling ? (Color){ 200, 130, 40, 255 } :
+                                     (Color){  70,  70,  70, 200 };
+    Color scBg     = subPro        ? (Color){  48,  40,  16, 255 } :
+                     subCancelling ? (Color){  48,  36,  14, 255 } :
+                                     (Color){  36,  36,  36, 235 };
+
+    DrawRectangleRounded((Rectangle){ scx + 3, scy + 4, scw, sch }, 0.12f, 8,
+                         (Color){ 0, 0, 0, 110 });
+    DrawRectangleRounded((Rectangle){ scx, scy, scw, sch }, 0.12f, 8, scBg);
+    DrawRectangleRoundedLines((Rectangle){ scx, scy, scw, sch }, 0.12f, 8, scBorder);
+
+    // titlu card
+    Color scTitleC = (subPro || subCancelling) ? GOLD : (Color){ 130, 130, 130, 255 };
+    DrawTextEx(gFont, "AI COACH PRO", (Vector2){ scx + 24, scy + 14 }, 20, 1, scTitleC);
+
+    // separator interior
+    DrawLine((int)(scx + 24), (int)(scy + 42), (int)(scx + scw - 24), (int)(scy + 42),
+             (Color){ 80, 80, 80, 180 });
+
+    // descriere status
+    const char *scDesc = subPro        ? "Subscription active. AI coaching features are enabled." :
+                         subCancelling ? "Cancelled. Access continues until the billing period ends." :
+                                         "Subscribe at the web app to unlock AI Coach Pro.";
+    Color scDescC = (subPro || subCancelling) ? (Color){ 180, 180, 180, 255 }
+                                               : (Color){ 110, 110, 110, 255 };
+    DrawTextEx(gFont, scDesc, (Vector2){ scx + 24, scy + 52 }, 14, 1, scDescC);
+
+    // badge status (sus-dreapta in card)
+    if (subPro || subCancelling) {
+        const char *badgeLbl = subPro ? "ACTIVE" : "CANCELLING";
+        Color badgeBg   = subPro ? (Color){ 35, 110, 45, 230 } : (Color){ 150, 90, 15, 230 };
+        Color badgeTxtC = (Color){ 220, 255, 220, 255 };
+        Vector2 blv = MeasureTextEx(gFont, badgeLbl, 12, 1);
+        float bpad = 9.0f;
+        Rectangle bRect = { scx + scw - blv.x - bpad * 2 - 20, scy + 12,
+                            blv.x + bpad * 2, blv.y + 6 };
+        DrawRectangleRounded(bRect, 0.5f, 8, badgeBg);
+        DrawTextEx(gFont, badgeLbl,
+                   (Vector2){ bRect.x + bpad, bRect.y + 3 },
+                   12, 1, badgeTxtC);
+    }
+
     // butoane jos
     float bw = 240.0f, bh = 50.0f;
-    float byTop = cy + ch + 30;
+    float byTop = scy + sch + 16.0f;
     float bxL = (WIN_W - (bw * 2 + 20)) * 0.5f;
 
     Rectangle bRefresh = { bxL, byTop, bw, bh };
@@ -1578,10 +1689,26 @@ void DrawProfile(void)
         curScreen = SCR_HOME;
     }
 
+    // buton gestionare abonament — deschide pagina de cont in browser
+    float mbY = byTop + bh + 12.0f;
+    float mbW = bw * 2 + 20.0f;
+    float mbH = 44.0f;
+    Rectangle bManage = { bxL, mbY, mbW, mbH };
+    const char *manageLbl = (subPro || subCancelling)
+                            ? "Manage Subscription  ->"
+                            : "Subscribe to AI Coach Pro  ->";
+    if (BtnGold(bManage, manageLbl, false)) {
+        char accountUrl[512];
+        snprintf(accountUrl, sizeof(accountUrl), "%s/account", frontend_url());
+        open_in_browser(accountUrl);
+    }
+
     // status (eg eroare refresh)
     if (loginStatus[0]) {
         Vector2 mv = MeasureTextEx(gFont, loginStatus, 14, 1);
-        DrawTextEx(gFont, loginStatus, (Vector2){ (WIN_W - mv.x) * 0.5f, byTop + bh + 16 }, 14, 1, loginStatusColor);
+        DrawTextEx(gFont, loginStatus,
+                   (Vector2){ (WIN_W - mv.x) * 0.5f, mbY + mbH + 14 },
+                   14, 1, loginStatusColor);
     }
 
     // Back
