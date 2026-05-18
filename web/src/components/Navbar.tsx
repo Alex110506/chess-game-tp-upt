@@ -16,7 +16,7 @@ export function Navbar() {
       <div className="container" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <Link to="/" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '1.5rem', fontWeight: 700 }}>
           <Crown className="text-gold" />
-          <span className="text-gradient">UPT Chess</span>
+          <span className="text-gradient">Chess</span>
         </Link>
         <div style={{ display: 'flex', gap: '1rem' }}>
           {token ? (

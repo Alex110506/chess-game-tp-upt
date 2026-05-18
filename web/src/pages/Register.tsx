@@ -33,7 +33,7 @@ export function Register() {
         <div style={{ textAlign: 'center', marginBottom: '2rem' }}>
           <Crown className="text-gold" size={48} style={{ margin: '0 auto 1rem' }} />
           <h2>Create Account</h2>
-          <p style={{ color: 'var(--text-muted)' }}>Join the UPT Chess community</p>
+          <p style={{ color: 'var(--text-muted)' }}>Join the Chess community</p>
         </div>
 
         {error && (
