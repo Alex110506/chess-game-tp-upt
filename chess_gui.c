@@ -2129,15 +2129,34 @@ static float MeasureRichHeight(const char *src, float maxW,
     return md_layout(&pm, r, fontSize, lineSpacing, BLANK, false);
 }
 
+static bool g_coach_waiting_engine = false;
+static char g_coach_pending_text[COACH_INPUT_MAX];
+
 // Trimite mesajul utilizatorului catre coach folosind starea curenta a partidei.
 static void coach_dispatch_send(const char *text)
 {
     if (!text || !*text) return;
-    char fen[160];
-    board_to_fen(fen, (int)sizeof(fen));
     const char *side = (current_turn == 0) ? "white" : "black";
-    const char *diff = (botDepth <= 1) ? "easy" : (botDepth <= 5) ? "medium" : "hard";
-    coach_send(text, fen, gLastMoveUci, side, diff);
+    const char *pcol = "white"; // umanul e mereu alb in vs bot
+
+    if (strcmp(side, pcol) == 0) {
+        if (sf_pid <= 0) sf_start();
+        if (sf_pid > 0) {
+            snprintf(g_coach_pending_text, sizeof(g_coach_pending_text), "%s", text);
+            g_coach_waiting_engine = true;
+            sf_request_move();
+        } else {
+            char fen[160];
+            board_to_fen(fen, (int)sizeof(fen));
+            const char *diff = (botDepth <= 1) ? "easy" : (botDepth <= 5) ? "medium" : "hard";
+            coach_send(text, fen, gLastMoveUci, side, diff, pcol, NULL);
+        }
+    } else {
+        char fen[160];
+        board_to_fen(fen, (int)sizeof(fen));
+        const char *diff = (botDepth <= 1) ? "easy" : (botDepth <= 5) ? "medium" : "hard";
+        coach_send(text, fen, gLastMoveUci, side, diff, pcol, NULL);
+    }
 }
 
 static void DrawCoachSidebar(void)
@@ -2483,6 +2502,17 @@ void DrawGame(void)
         hintDstCol = sf_bestmove[2] - 'a';
         hintDstRow = 8 - (sf_bestmove[3] - '0');
         gameSt = ST_SELECT;
+    }
+
+    /* ── coach: polling pentru bestmove ── */
+    if (g_coach_waiting_engine && sf_poll_move()) {
+        g_coach_waiting_engine = false;
+        char fen[160];
+        board_to_fen(fen, (int)sizeof(fen));
+        const char *side  = (current_turn == 0) ? "white" : "black";
+        const char *diff  = (botDepth <= 1) ? "easy" : (botDepth <= 5) ? "medium" : "hard";
+        const char *pcol  = "white";
+        coach_send(g_coach_pending_text, fen, gLastMoveUci, side, diff, pcol, sf_bestmove);
     }
 
     /* ── multiplayer: polling pentru mutari sau evenimente ── */

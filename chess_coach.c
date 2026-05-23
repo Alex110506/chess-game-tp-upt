@@ -43,6 +43,12 @@ static int         g_msg_count = 0;
 static CoachStatus g_status    = COACH_IDLE;
 static char        g_error[COACH_ERR_MAX];
 
+/* Mutare UCI extrasa din footer-ul <<BESTMOVE:...>> al ultimului raspuns
+ * (ex: "e2e4" / "e7e8q"). `g_best_move_pending` devine true cand soseste si
+ * se reseteaza la false dupa ce UI-ul o consuma via coach_pop_best_move. */
+static char        g_best_move[8] = "";
+static bool        g_best_move_pending = false;
+
 /* Identificator de sesiune trimis catre server (informatie de log). */
 static char g_session_id[24];
 
@@ -222,6 +228,8 @@ typedef struct {
     char  last_move[16];
     char  side[8];
     char  difficulty[16];
+    char  player_color[8];
+    char  best_move[8];
 } CoachJobInputs;
 
 /* Construieste payload-ul JSON intr-un buffer alocat dinamic. Caller-ul
@@ -282,6 +290,16 @@ static char *build_payload(const CoachJobInputs *in)
     if (in->difficulty[0]) {
         APPEND_LIT(",\"difficulty\":\"");
         if (!json_append_escaped(&p, end, in->difficulty)) { free(buf); return NULL; }
+        APPEND_LIT("\"");
+    }
+    if (in->player_color[0]) {
+        APPEND_LIT(",\"player_color\":\"");
+        if (!json_append_escaped(&p, end, in->player_color)) { free(buf); return NULL; }
+        APPEND_LIT("\"");
+    }
+    if (in->best_move[0]) {
+        APPEND_LIT(",\"best_move\":\"");
+        if (!json_append_escaped(&p, end, in->best_move)) { free(buf); return NULL; }
         APPEND_LIT("\"");
     }
     if (g_session_id[0]) {
@@ -352,6 +370,14 @@ static void sse_handle_line(SseParserState *ss, const char *line)
         pthread_mutex_lock(&g_lock);
         snprintf(g_error, sizeof(g_error), "%s", val);
         g_status = COACH_ERROR;
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    if (json_get_str(data, "bm", val, (int)sizeof(val))) {
+        /* mutare sugerata extrasa din footer (UCI: "e2e4" / "e7e8q") */
+        pthread_mutex_lock(&g_lock);
+        snprintf(g_best_move, sizeof(g_best_move), "%s", val);
+        g_best_move_pending = true;
         pthread_mutex_unlock(&g_lock);
         return;
     }
@@ -518,6 +544,8 @@ void coach_init(void)
     g_msg_count = 0;
     g_status    = COACH_IDLE;
     g_error[0]  = '\0';
+    g_best_move[0] = '\0';
+    g_best_move_pending = false;
     g_shutdown  = false;
     snprintf(g_session_id, sizeof(g_session_id), "gui-%ld", (long)time(NULL));
     pthread_mutex_unlock(&g_lock);
@@ -554,6 +582,8 @@ void coach_reset(void)
     g_msg_count = 0;
     g_status    = COACH_IDLE;
     g_error[0]  = '\0';
+    g_best_move[0] = '\0';
+    g_best_move_pending = false;
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -585,11 +615,27 @@ int coach_snapshot(ChatMsg *dst, int dst_max)
     return n;
 }
 
+bool coach_pop_best_move(char *out, int out_sz)
+{
+    if (!out || out_sz <= 0) return false;
+    bool got = false;
+    pthread_mutex_lock(&g_lock);
+    if (g_best_move_pending) {
+        snprintf(out, (size_t)out_sz, "%s", g_best_move);
+        g_best_move_pending = false;
+        got = true;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return got;
+}
+
 bool coach_send(const char *user_text,
                 const char *fen,
                 const char *last_move,
                 const char *side_to_move,
-                const char *difficulty)
+                const char *difficulty,
+                const char *player_color,
+                const char *best_move)
 {
     if (!user_text || !*user_text || !fen || !*fen) return false;
 
@@ -605,9 +651,11 @@ bool coach_send(const char *user_text,
 
     CoachJobInputs in = {0};
     snprintf(in.fen,         sizeof(in.fen),         "%s", fen);
-    if (last_move)     snprintf(in.last_move,  sizeof(in.last_move),  "%s", last_move);
-    if (side_to_move)  snprintf(in.side,       sizeof(in.side),       "%s", side_to_move);
-    if (difficulty)    snprintf(in.difficulty, sizeof(in.difficulty), "%s", difficulty);
+    if (last_move)     snprintf(in.last_move,    sizeof(in.last_move),    "%s", last_move);
+    if (side_to_move)  snprintf(in.side,         sizeof(in.side),         "%s", side_to_move);
+    if (difficulty)    snprintf(in.difficulty,   sizeof(in.difficulty),   "%s", difficulty);
+    if (player_color)  snprintf(in.player_color, sizeof(in.player_color), "%s", player_color);
+    if (best_move)     snprintf(in.best_move,    sizeof(in.best_move),    "%s", best_move);
 
     char *payload = build_payload(&in);
     if (!payload) {

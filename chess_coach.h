@@ -50,12 +50,16 @@ void coach_reset(void);
 /* Adauga mesajul utilizatorului si porneste cererea catre backend pe un fir
  * secundar. Returneaza true daca cererea a fost programata, false daca o
  * cerere este deja in curs sau argumentele sunt invalide. Toate sirurile
- * sunt copiate intern. */
+ * sunt copiate intern. `player_color` este "white" sau "black" — culoarea
+ * jucatorului uman (NU partea care muta acum). Critica pentru a evita ca
+ * modelul sa confunde piesele jucatorului cu cele ale botului. */
 bool coach_send(const char *user_text,
                 const char *fen,
                 const char *last_move,
                 const char *side_to_move,
-                const char *difficulty);
+                const char *difficulty,
+                const char *player_color,
+                const char *best_move);
 
 /* Status curent. Sigur pentru citire din firul de UI. */
 CoachStatus coach_status(void);
@@ -67,5 +71,12 @@ const char *coach_last_error(void);
 /* Copiaza intregul istoric de mesaje in dst. Returneaza cate au fost
  * copiate (<= dst_max). Sigur pentru apel din firul de UI. */
 int coach_snapshot(ChatMsg *dst, int dst_max);
+
+/* Daca raspunsul curent al coach-ului contine o mutare sugerata noua (extrasa
+ * din footer-ul <<BESTMOVE:...>>), o copiaza in `out` in format UCI (ex
+ * "e2e4" sau "e7e8q") si returneaza true; in caz contrar returneaza false.
+ * Mutarea este consumata: apelurile urmatoare vor returna false pana cand
+ * o noua mutare soseste. Sigura pentru apel din firul de UI. */
+bool coach_pop_best_move(char *out, int out_sz);
 
 #endif /* CHESS_COACH_H */
