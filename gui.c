@@ -1,6 +1,7 @@
 #include "raylib.h"
 #include "chess_gui.h"
 #include "chess_auth.h"
+#include "chess_coach.h"
 
 int main(void)
 {
@@ -16,9 +17,16 @@ int main(void)
     auth_init();
     auth_load_session();
 
+    // initializam clientul AI Coach (fir worker + curl) — partajeaza libcurl
+    // global cu chess_auth si nu apeleaza curl_global_cleanup la cleanup.
+    coach_init();
+
     // bucla principala a jocului
     // ruleaza pana cand utilizatorul inchide fereastra
     while (!WindowShouldClose()) {
+        // sincronizam vizibilitatea sidebar-ului coach in functie de ecran
+        coach_sync_visibility();
+
         BeginDrawing();
 
         // afiseaza ecranul corespunzator starii curente
@@ -48,6 +56,8 @@ int main(void)
     sf_stop();
     // oprim procesul bridge de multiplayer (daca exista)
     mp_cleanup();
+    // oprim worker-ul AI Coach (asteapta finalizarea unei cereri in curs)
+    coach_cleanup();
     // eliberam memoria ocupata de fonturi
     cleanup_fonts();
     // curatam libcurl

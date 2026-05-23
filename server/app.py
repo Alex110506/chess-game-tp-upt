@@ -575,3 +575,12 @@ async def ws_endpoint(ws: WebSocket):
             if peer is not None:
                 await _send(peer, {"type": "opponent_left"})
             await _drop_room(my_room.code)
+
+
+# ---------------------------------------------------------------------------
+# AI Chess Coach (premium-only). See server/coach.py.
+# ---------------------------------------------------------------------------
+
+from coach import router as coach_router  # noqa: E402
+
+app.include_router(coach_router)

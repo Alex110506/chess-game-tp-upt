@@ -45,4 +45,9 @@ void sf_stop(void);
 // opreste procesul de retea pentru multiplayer in caz de iesire
 void mp_cleanup(void);
 
+// inchide sidebar-ul AI Coach si readuce fereastra la dimensiunea standard
+// daca este in continuare expandata. Sigura de apelat oricand, no-op cand
+// sidebar-ul este deja inchis.
+void coach_sync_visibility(void);
+
 #endif // CHESS_GUI_H

@@ -13,6 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/file.h>
+#include <sys/types.h>
 #include <curl/curl.h>
 
 AuthState gAuth = {0};
@@ -23,18 +27,61 @@ AuthState gAuth = {0};
 
 static char g_server_url[256] = {0};
 static char g_session_file[256] = {0};
+// fd cu lacat exclusiv (flock) pe fisierul de sesiune. Cand este >= 0,
+// procesul curent detine fisierul si toate scrierile trec prin acest fd
+// (pentru ca lacatul sa ramana valid chiar daca fisierul este re-deschis
+// din alta parte). -1 inseamna fie env override (CHESS_SESSION_FILE) fie
+// ca initializarea n-a reusit — caz in care cadem inapoi pe fopen direct.
+static int  g_session_fd = -1;
 static bool g_curl_inited = false;
 
-// returneaza calea fisierului de sesiune; permite izolare per-proces
-// prin variabila de mediu CHESS_SESSION_FILE (utila cand rulezi mai multe
-// GUI-uri pe aceeasi masina cu conturi diferite).
-static const char *session_file_path(void)
+static void session_release_lock(void)
 {
-    if (g_session_file[0]) return g_session_file;
+    if (g_session_fd >= 0) {
+        flock(g_session_fd, LOCK_UN);
+        close(g_session_fd);
+        g_session_fd = -1;
+    }
+}
+
+// alege calea fisierului de sesiune si incearca sa obtina un lacat exclusiv.
+// Daca CHESS_SESSION_FILE este setat -> respectam alegerea utilizatorului
+// fara lacat. Altfel: incercam fisierul implicit; daca alta instanta deja
+// detine lacatul, cadem pe un nume sufixat cu PID, astfel incat doua GUI-uri
+// rulate simultan sa nu-si calce in picioare sesiunile.
+static void session_init(void)
+{
+    if (g_session_file[0]) return;
+
     const char *env = getenv("CHESS_SESSION_FILE");
-    if (env && *env) snprintf(g_session_file, sizeof(g_session_file), "%s", env);
-    else             snprintf(g_session_file, sizeof(g_session_file), "%s", DEFAULT_SESSION_PATH);
-    return g_session_file;
+    if (env && *env) {
+        snprintf(g_session_file, sizeof(g_session_file), "%s", env);
+        return;
+    }
+
+    int fd = open(DEFAULT_SESSION_PATH, O_RDWR | O_CREAT, 0600);
+    if (fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        g_session_fd = fd;
+        snprintf(g_session_file, sizeof(g_session_file), "%s", DEFAULT_SESSION_PATH);
+        atexit(session_release_lock);
+        return;
+    }
+    if (fd >= 0) close(fd);
+
+    // exista deja un GUI care detine fisierul implicit — folosim unul propriu
+    char alt[256];
+    snprintf(alt, sizeof(alt), "chess_session.%d.txt", (int)getpid());
+    fd = open(alt, O_RDWR | O_CREAT, 0600);
+    if (fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        g_session_fd = fd;
+        snprintf(g_session_file, sizeof(g_session_file), "%s", alt);
+        atexit(session_release_lock);
+        return;
+    }
+    if (fd >= 0) close(fd);
+
+    // fallback: continuam fara lacat
+    snprintf(g_session_file, sizeof(g_session_file), "%s", DEFAULT_SESSION_PATH);
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +440,8 @@ int auth_report_game(const char *result, const char *opponent,
 
 void auth_load_session(void)
 {
-    FILE *f = fopen(session_file_path(), "r");
+    session_init();
+    FILE *f = fopen(g_session_file, "r");
     if (!f) return;
     char uname[AUTH_USERNAME_MAX] = {0};
     char token[AUTH_TOKEN_MAX] = {0};
@@ -416,7 +464,21 @@ void auth_save_session(void)
         auth_clear_session();
         return;
     }
-    FILE *f = fopen(session_file_path(), "w");
+    session_init();
+    // cand detinem lacatul, scriem prin fd-ul lacatuit (pastreaza inode-ul
+    // si deci si lacatul). Doar daca nu avem fd (env override sau init esuat)
+    // cadem pe fopen.
+    if (g_session_fd >= 0) {
+        char buf[AUTH_USERNAME_MAX + AUTH_TOKEN_MAX + 4];
+        int n = snprintf(buf, sizeof(buf), "%s %s\n", gAuth.username, gAuth.token);
+        if (n <= 0) return;
+        if (lseek(g_session_fd, 0, SEEK_SET) < 0) return;
+        if (ftruncate(g_session_fd, 0) < 0) return;
+        ssize_t w = write(g_session_fd, buf, (size_t)n);
+        (void)w;
+        return;
+    }
+    FILE *f = fopen(g_session_file, "w");
     if (!f) return;
     fprintf(f, "%s %s\n", gAuth.username, gAuth.token);
     fclose(f);
@@ -430,5 +492,13 @@ void auth_clear_session(void)
     gAuth.wins = gAuth.losses = gAuth.ties = 0;
     gAuth.rank = 0;
     gAuth.subscription[0] = '\0';
-    remove(session_file_path());
+    session_init();
+    // daca detinem lacatul, doar trunchiem fisierul — nu-l stergem, ca sa
+    // pastram inode-ul si lacatul valide. Altfel folosim remove ca inainte.
+    if (g_session_fd >= 0) {
+        if (lseek(g_session_fd, 0, SEEK_SET) >= 0)
+            (void)ftruncate(g_session_fd, 0);
+        return;
+    }
+    if (g_session_file[0]) remove(g_session_file);
 }

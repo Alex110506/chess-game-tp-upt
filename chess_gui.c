@@ -10,6 +10,7 @@
 #include "chess_gui.h"
 #include "chess_net.h"
 #include "chess_auth.h"
+#include "chess_coach.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -31,6 +32,11 @@
 #define PANEL_Y BOARD_Y
 #define PANEL_W 230
 #define PANEL_H BOARD_PX
+
+// sidebar AI Coach (afisat la dreapta ferestrei, in afara layout-ului standard).
+// Fereastra se expandeaza la WIN_W + COACH_W cand sidebar-ul este deschis.
+#define COACH_W 360
+#define COACH_X WIN_W
 
 //culori
 #define C_LIGHT (Color){ 240, 217, 181, 255 }
@@ -125,6 +131,43 @@ static bool mpResultReported = false;
 
 // gate pentru multiplayer cand nu suntem logati
 static bool showLoginGate = false;
+
+// AI Coach (sidebar lateral): stare locala.
+static bool   coachOpen = false;
+static bool   coachWindowExpanded = false;
+static char   coachInput[COACH_INPUT_MAX] = "";
+static int    coachInputLen = 0;
+static float  coachScroll = 0.0f;             // px scroll de jos in sus
+static double coachLastEditT = 0.0;           // pt blink-ul cursorului in input
+static char   gLastMoveUci[16] = "";          // ex: "e2e4" / "e7e8q" (vacant la start)
+
+static void coach_set_open_state(bool open)
+{
+    if (open == coachOpen) return;
+    coachOpen = open;
+    if (open && !coachWindowExpanded) {
+        SetWindowSize(WIN_W + COACH_W, WIN_H);
+        coachWindowExpanded = true;
+    } else if (!open && coachWindowExpanded) {
+        SetWindowSize(WIN_W, WIN_H);
+        coachWindowExpanded = false;
+    }
+}
+
+void coach_sync_visibility(void)
+{
+    if (curScreen != SCR_GAME && coachOpen) {
+        coach_set_open_state(false);
+    }
+}
+
+// true daca abonamentul curent permite accesul la AI Coach
+static bool coach_is_premium(void)
+{
+    return gAuth.logged_in &&
+           (strcmp(gAuth.subscription, "pro") == 0 ||
+            strcmp(gAuth.subscription, "cancelling") == 0);
+}
 
 // stare mod "puzzle" (probleme de sah cu sah-mat in N mutari)
 static int  puzzleMode = 0;        // 1 = jucam un puzzle
@@ -628,6 +671,11 @@ static void execute_sf_move(void)
             : sf_bestmove[4];
     }
 
+    {
+        char uci[8];
+        coords_to_uci(r1, c1, r2, c2, promo, uci);
+        snprintf(gLastMoveUci, sizeof(gLastMoveUci), "%s", uci);
+    }
     execute_move(r1, c1, r2, c2, promo ? promo : 'Q');
     current_turn = 1 - current_turn;
 }
@@ -895,6 +943,15 @@ void DrawHome(void)
         if (hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
             if (gAuth.logged_in) {
                 loginStatus[0] = '\0';
+                // sincronizam profilul (inclusiv statusul abonamentului) cu
+                // backend-ul la fiecare intrare, ca utilizatorul sa nu fie
+                // nevoit sa se relogheze dupa cumparare/anulare.
+                char err[AUTH_ERR_MAX] = {0};
+                auth_refresh_profile(err, sizeof(err));
+                if (err[0]) {
+                    snprintf(loginStatus, sizeof(loginStatus), "%s", err);
+                    loginStatusColor = (Color){ 220, 80, 80, 255 };
+                }
                 curScreen = SCR_PROFILE;
             } else {
                 loginStatus[0] = '\0';
@@ -1075,6 +1132,8 @@ void DrawBotSetup(void)
             current_turn = 0;
             selRow = selCol = -1;
             hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+            gLastMoveUci[0] = '\0';
+            coach_reset();
             gameSt = ST_SELECT;
             curScreen = SCR_GAME;
         }
@@ -1091,6 +1150,8 @@ void DrawBotSetup(void)
             current_turn = 0;
             selRow = selCol = -1;
             hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+            gLastMoveUci[0] = '\0';
+            coach_reset();
             gameSt = ST_SELECT;
             curScreen = SCR_GAME;
         }
@@ -1107,6 +1168,8 @@ void DrawBotSetup(void)
             current_turn = 0;
             selRow = selCol = -1;
             hintSrcRow = hintSrcCol = hintDstRow = hintDstCol = -1;
+            gLastMoveUci[0] = '\0';
+            coach_reset();
             gameSt = ST_SELECT;
             curScreen = SCR_GAME;
         }
@@ -1825,6 +1888,531 @@ void DrawTimeSetup(void)
 }
 
 //ecran de joc
+/* ─────────────────────────────────────────────────────────────────────────
+ * AI Coach sidebar — desenat la dreapta ferestrei expandate.
+ *
+ * Conventii layout in interiorul sidebar-ului (x = COACH_X, y din [0, WIN_H)):
+ *   [ 0   .. 50 )   bara de titlu (label + buton de inchidere "X")
+ *   [50   .. 80 )   bara de status (idle / thinking / error)
+ *   [80   .. WIN_H - 100 )  zona de mesaje, scrollabila vertical
+ *   [WIN_H - 96 .. WIN_H - 56 )  input + buton Send
+ *   [WIN_H - 48 .. WIN_H - 12 )  buton Hint
+ * ────────────────────────────────────────────────────────────────────── */
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Markdown ușor: parser + renderer cu wrap.
+ *
+ * Suportam un singur construct markdown: **bold**. Caracterele `**` sunt
+ * eliminate din text si zonele dintre perechi sunt marcate cu un flag bold
+ * pe care renderer-ul il foloseste pentru a desena textul de doua ori cu un
+ * mic decalaj (faux-bold), de vreme ce nu incarcam un font cu greutate
+ * separata.
+ *
+ * In timpul streaming-ului, daca un `**` deschis inca nu are pereche, restul
+ * textului apare bold pana cand inchiderea soseste — efect natural intr-un
+ * efect "typing" si corectat cand pereche se completeaza.
+ * ────────────────────────────────────────────────────────────────────── */
+
+#define COACH_MD_TEXT_MAX  COACH_MSG_CAP   /* normalized text capacity     */
+#define COACH_MD_RUN_MAX   128             /* max bold/normal segments     */
+
+typedef struct {
+    int  start;
+    int  len;
+    bool bold;
+} StyledRun;
+
+typedef struct {
+    char       text[COACH_MD_TEXT_MAX];
+    int        text_len;
+    StyledRun  runs[COACH_MD_RUN_MAX];
+    int        run_count;
+} ParsedMD;
+
+static void parse_markdown(const char *src, ParsedMD *out)
+{
+    out->text_len  = 0;
+    out->run_count = 0;
+    out->text[0]   = '\0';
+    if (!src) return;
+
+    bool bold = false;
+    int  run_start = 0;
+    int  si = 0;
+    int  src_len = (int)strlen(src);
+    int  cap = (int)sizeof(out->text) - 1;
+
+    while (si < src_len && out->text_len < cap) {
+        if (src[si] == '*' && si + 1 < src_len && src[si + 1] == '*') {
+            // pereche **: comutam starea bold si inchidem run-ul curent
+            if (out->text_len > run_start && out->run_count < COACH_MD_RUN_MAX) {
+                out->runs[out->run_count++] = (StyledRun){
+                    run_start, out->text_len - run_start, bold
+                };
+                run_start = out->text_len;
+            }
+            bold = !bold;
+            si += 2;
+            continue;
+        }
+        out->text[out->text_len++] = src[si++];
+    }
+    out->text[out->text_len] = '\0';
+
+    if (out->text_len > run_start && out->run_count < COACH_MD_RUN_MAX) {
+        out->runs[out->run_count++] = (StyledRun){
+            run_start, out->text_len - run_start, bold
+        };
+    }
+}
+
+// Gaseste indexul run-ului care contine offset-ul `pos`. Daca pos e dincolo
+// de toate run-urile, returneaza run_count.
+static int md_run_at(const ParsedMD *pm, int pos)
+{
+    for (int i = 0; i < pm->run_count; i++) {
+        if (pos < pm->runs[i].start + pm->runs[i].len) return i;
+    }
+    return pm->run_count;
+}
+
+// Masoara latimea logica a portiunii [s, e) din text, respectand granitele
+// de run (segmentele bold adauga ~1px pentru efectul faux-bold).
+static float md_measure(const ParsedMD *pm, int s, int e, float fontSize)
+{
+    if (s >= e) return 0.0f;
+    float w = 0.0f;
+    int cur = s;
+    int ri = md_run_at(pm, cur);
+    while (cur < e && ri < pm->run_count) {
+        int rend    = pm->runs[ri].start + pm->runs[ri].len;
+        int seg_end = (rend < e) ? rend : e;
+        int seg_len = seg_end - cur;
+        if (seg_len <= 0) { ri++; continue; }
+
+        char buf[512];
+        if (seg_len >= (int)sizeof(buf)) seg_len = (int)sizeof(buf) - 1;
+        memcpy(buf, pm->text + cur, (size_t)seg_len);
+        buf[seg_len] = '\0';
+        Vector2 m = MeasureTextEx(gFont, buf, fontSize, 1.0f);
+        w += m.x;
+        if (pm->runs[ri].bold) w += 1.0f;
+        cur = seg_end;
+        if (cur >= rend) ri++;
+    }
+    return w;
+}
+
+// Deseneaza portiunea [s, e) incepand de la (*xref, y). Avanseaza *xref pe
+// masura ce deseneaza. Segmentele bold sunt desenate de doua ori cu un mic
+// decalaj orizontal (faux-bold).
+static void md_draw(const ParsedMD *pm, int s, int e,
+                    float *xref, float y, float fontSize, Color color)
+{
+    if (s >= e) return;
+    int cur = s;
+    int ri = md_run_at(pm, cur);
+    while (cur < e && ri < pm->run_count) {
+        int rend    = pm->runs[ri].start + pm->runs[ri].len;
+        int seg_end = (rend < e) ? rend : e;
+        int seg_len = seg_end - cur;
+        if (seg_len <= 0) { ri++; continue; }
+
+        char buf[512];
+        if (seg_len >= (int)sizeof(buf)) seg_len = (int)sizeof(buf) - 1;
+        memcpy(buf, pm->text + cur, (size_t)seg_len);
+        buf[seg_len] = '\0';
+
+        Vector2 m = MeasureTextEx(gFont, buf, fontSize, 1.0f);
+        DrawTextEx(gFont, buf, (Vector2){ *xref, y }, fontSize, 1.0f, color);
+        if (pm->runs[ri].bold) {
+            DrawTextEx(gFont, buf, (Vector2){ *xref + 0.75f, y },
+                       fontSize, 1.0f, color);
+            *xref += m.x + 1.0f;
+        } else {
+            *xref += m.x;
+        }
+        cur = seg_end;
+        if (cur >= rend) ri++;
+    }
+}
+
+// Layout + desenare unificate. Daca `draw` este false, doar calculeaza
+// inaltimea totala (pentru scroll). Returneaza inaltimea ocupata.
+static float md_layout(const ParsedMD *pm, Rectangle bounds,
+                       float fontSize, float lineSp, Color color, bool draw)
+{
+    if (pm->text_len == 0) return 0.0f;
+    float lineH = fontSize + lineSp;
+    float y    = bounds.y;
+    float maxW = bounds.width;
+    int   pos  = 0;
+    int   len  = pm->text_len;
+
+    while (pos < len) {
+        if (pm->text[pos] == '\n') {
+            y += lineH;
+            pos++;
+            continue;
+        }
+
+        float x         = bounds.x;
+        int   line_start = pos;
+        int   line_end   = pos;
+
+        // greedy: adaugam cuvinte cat timp incap pe linie
+        while (pos < len && pm->text[pos] != '\n') {
+            int wend = pos;
+            while (wend < len && pm->text[wend] != ' ' && pm->text[wend] != '\n')
+                wend++;
+            int after = wend;
+            if (after < len && pm->text[after] == ' ') after++;
+
+            float wword = md_measure(pm, pos, after, fontSize);
+
+            if (x + wword > bounds.x + maxW && pos > line_start) {
+                break;  // wrap
+            }
+            // forced break daca un singur cuvant depaseste latimea
+            if (x + wword > bounds.x + maxW && pos == line_start) {
+                // gasim cati bytes incap (binary search pe lungime)
+                int lo = 1, hi = after - pos;
+                while (lo < hi) {
+                    int mid = (lo + hi + 1) / 2;
+                    if (md_measure(pm, pos, pos + mid, fontSize) <= maxW)
+                        lo = mid;
+                    else
+                        hi = mid - 1;
+                }
+                after = pos + (lo > 0 ? lo : 1);
+                wword = md_measure(pm, pos, after, fontSize);
+            }
+
+            x   += wword;
+            pos  = after;
+            line_end = pos;
+        }
+
+        if (draw) {
+            float xref = bounds.x;
+            // taie spatiile finale pentru aliniere vizuala curata
+            int draw_end = line_end;
+            while (draw_end > line_start && pm->text[draw_end - 1] == ' ') draw_end--;
+            md_draw(pm, line_start, draw_end, &xref, y, fontSize, color);
+        }
+
+        y += lineH;
+        if (pos < len && pm->text[pos] == '\n') pos++;
+    }
+
+    return y - bounds.y;
+}
+
+// Wrappers cu interfata vechea: nu apeleaza parser-ul direct, ci primesc
+// un string deja parsat. Pentru a evita parsing dublu, callerii folosesc
+// parse_markdown -> md_layout.
+
+static float DrawRichWrapped(const char *src, Rectangle bounds,
+                             float fontSize, float lineSpacing, Color color)
+{
+    ParsedMD pm;
+    parse_markdown(src, &pm);
+    return md_layout(&pm, bounds, fontSize, lineSpacing, color, true);
+}
+
+static float MeasureRichHeight(const char *src, float maxW,
+                               float fontSize, float lineSpacing)
+{
+    ParsedMD pm;
+    parse_markdown(src, &pm);
+    Rectangle r = { 0, 0, maxW, 1e6f };
+    return md_layout(&pm, r, fontSize, lineSpacing, BLANK, false);
+}
+
+// Trimite mesajul utilizatorului catre coach folosind starea curenta a partidei.
+static void coach_dispatch_send(const char *text)
+{
+    if (!text || !*text) return;
+    char fen[160];
+    board_to_fen(fen, (int)sizeof(fen));
+    const char *side = (current_turn == 0) ? "white" : "black";
+    const char *diff = (botDepth <= 1) ? "easy" : (botDepth <= 5) ? "medium" : "hard";
+    coach_send(text, fen, gLastMoveUci, side, diff);
+}
+
+static void DrawCoachSidebar(void)
+{
+    if (!coachOpen) return;
+    Vector2 mouse = GetMousePosition();
+
+    const float sbX = (float)COACH_X;
+    const float sbW = (float)COACH_W;
+    const float sbH = (float)WIN_H;
+
+    // paleta sidebar — verde/maro/gri, in linie cu restul jocului
+    const Color SB_BG          = (Color){  24,  22,  20, 255 };  // fundal cald inchis
+    const Color SB_TITLE_BG    = (Color){  46,  74,  52, 255 };  // verde inchis (apropiat de C_BTN)
+    const Color SB_TITLE_LINE  = (Color){  90, 130,  90, 255 };
+    const Color SB_TITLE_TXT   = (Color){ 245, 240, 220, 255 };  // C_WHITE_P
+    const Color SB_CLOSE_BG    = (Color){  64,  46,  32, 255 };  // maro inchis
+    const Color SB_CLOSE_HOV   = (Color){ 150,  70,  60, 255 };
+
+    // fundal panou
+    DrawRectangle((int)sbX, 0, (int)sbW, (int)sbH, SB_BG);
+    DrawLine((int)sbX, 0, (int)sbX, (int)sbH, (Color){ 70, 60, 50, 255 });
+
+    /* ── bara de titlu ── */
+    Rectangle titleBar = { sbX, 0, sbW, 50 };
+    DrawRectangleRec(titleBar, SB_TITLE_BG);
+    DrawLine((int)sbX, 50, (int)(sbX + sbW), 50, SB_TITLE_LINE);
+    DrawTextEx(gFont, "AI Chess Coach",
+               (Vector2){ sbX + 14, 13 }, 24, 1, SB_TITLE_TXT);
+
+    // buton de inchidere "X"
+    Rectangle rClose = { sbX + sbW - 42, 10, 32, 30 };
+    bool closeHov = CheckCollisionPointRec(mouse, rClose);
+    DrawRectangleRounded(rClose, 0.3f, 6, closeHov ? SB_CLOSE_HOV : SB_CLOSE_BG);
+    Vector2 xv = MeasureTextEx(gFont, "X", 18, 1);
+    DrawTextEx(gFont, "X",
+               (Vector2){ rClose.x + (rClose.width - xv.x) * 0.5f,
+                          rClose.y + (rClose.height - xv.y) * 0.5f },
+               18, 1, WHITE);
+    if (closeHov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        coach_set_open_state(false);
+        return; // urmatorul frame va sari peste sidebar
+    }
+
+    /* ── bara de status ── */
+    float statusY = 58.0f;
+    CoachStatus cs = coach_status();
+    const char *statusTxt;
+    Color statusColor;
+    switch (cs) {
+        case COACH_THINKING:  statusTxt = "Coach is thinking..."; statusColor = (Color){235, 195, 110, 255}; break;
+        case COACH_STREAMING: statusTxt = "Coach is typing...";   statusColor = (Color){140, 220, 120, 255}; break;
+        case COACH_ERROR: {
+            static char buf[COACH_ERR_MAX + 16];
+            snprintf(buf, sizeof(buf), "Error: %s", coach_last_error());
+            statusTxt = buf;
+            statusColor = (Color){235, 110, 100, 255};
+            break;
+        }
+        default:              statusTxt = "Ready";                statusColor = (Color){170, 200, 160, 255}; break;
+    }
+    DrawTextEx(gFont, statusTxt,
+               (Vector2){ sbX + 14, statusY }, 14, 1, statusColor);
+
+    /* ── input + butoane (fixate jos) ── */
+    float inputRowY = sbH - 60.0f;
+    Rectangle rInput = { sbX + 12, inputRowY, sbW - 24 - 84, 44 };
+    Rectangle rSend  = { sbX + sbW - 12 - 78, inputRowY, 78, 44 };
+
+    /* ── zona de mesaje (intre status si input) ── */
+    Rectangle msgArea = { sbX + 12, statusY + 28.0f,
+                          sbW - 24,
+                          inputRowY - (statusY + 28.0f) - 10.0f };
+
+    /* scroll cu rotita */
+    if (CheckCollisionPointRec(mouse, msgArea)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) coachScroll += wheel * 28.0f;
+    }
+
+    /* incarcam un snapshot al mesajelor */
+    static ChatMsg snap[COACH_MAX_MSG];
+    int cnt = coach_snapshot(snap, COACH_MAX_MSG);
+
+    // paleta bubble + text
+    const Color SB_TEXT      = (Color){ 232, 226, 212, 255 };  // alb cald
+    const Color SB_WELCOME   = (Color){ 200, 185, 150, 255 };  // crem
+    const Color SB_USER_BG   = (Color){  46, 105,  56, 255 };  // C_BTN verde
+    const Color SB_COACH_BG  = (Color){  58,  50,  42, 255 };  // maro/gri cald
+    const Color SB_USER_WHO  = (Color){ 210, 240, 210, 255 };
+    const Color SB_COACH_WHO = (Color){ 220, 195, 150, 255 };
+
+    /* daca nu sunt mesaje, afisam un mesaj de bun venit */
+    if (cnt == 0) {
+        const char *welcome =
+            "Hi! I'm your chess coach.\n\n"
+            "Ask me anything about the position, your last move, or what plan to follow.";
+        BeginScissorMode((int)msgArea.x, (int)msgArea.y, (int)msgArea.width, (int)msgArea.height);
+        DrawRichWrapped(welcome, msgArea, 17, 5, SB_WELCOME);
+        EndScissorMode();
+    } else {
+        /* Calculam inaltimea totala a continutului si pozitionam vertical */
+        const float pad       = 8.0f;
+        const float bubbleGap = 12.0f;
+        const float innerPad  = 12.0f;
+        const float fontSize  = 17.0f;
+        const float lineSp    = 5.0f;
+        const float whoExtra  = 14.0f;  // spatiu sub eticheta "You/Coach"
+
+        float totalH = 0.0f;
+        float bubbleH[COACH_MAX_MSG];
+        for (int i = 0; i < cnt; i++) {
+            float maxW = msgArea.width - innerPad * 2 - 24.0f;
+            float h = MeasureRichHeight(snap[i].content, maxW, fontSize, lineSp);
+            if (h < fontSize + 2) h = fontSize + 2;
+            bubbleH[i] = h + innerPad * 2 + whoExtra;
+            totalH += bubbleH[i] + bubbleGap;
+        }
+
+        float maxScroll = totalH - msgArea.height + pad;
+        if (maxScroll < 0) maxScroll = 0;
+        if (coachScroll < 0)         coachScroll = 0;
+        if (coachScroll > maxScroll) coachScroll = maxScroll;
+
+        BeginScissorMode((int)msgArea.x, (int)msgArea.y, (int)msgArea.width, (int)msgArea.height);
+
+        // pozitionam de jos in sus (cel mai recent mesaj jos)
+        float y = msgArea.y + msgArea.height - pad + coachScroll;
+        for (int i = cnt - 1; i >= 0; i--) {
+            y -= bubbleH[i];
+            bool isUser = (snap[i].role == COACH_ROLE_USER);
+
+            float bubW = msgArea.width - 24.0f;
+            float bubX = isUser ? (msgArea.x + msgArea.width - bubW - 4.0f)
+                                : (msgArea.x + 4.0f);
+            Rectangle bub = { bubX, y, bubW, bubbleH[i] };
+            Color bubBg = isUser ? SB_USER_BG : SB_COACH_BG;
+            DrawRectangleRounded(bub, 0.18f, 8, bubBg);
+
+            // marker mic (cine vorbeste)
+            const char *who = isUser ? "You" : "Coach";
+            Color whoCol  = isUser ? SB_USER_WHO : SB_COACH_WHO;
+            DrawTextEx(gFont, who, (Vector2){ bub.x + innerPad, bub.y + 5 }, 11, 2, whoCol);
+
+            // continut
+            Rectangle txtR = { bub.x + innerPad,
+                               bub.y + innerPad + whoExtra,
+                               bub.width - innerPad * 2,
+                               bub.height - innerPad * 2 - whoExtra };
+            // Daca asistentul nu a primit inca niciun token, afiseaza un placeholder
+            if (!isUser && snap[i].len == 0 &&
+                (cs == COACH_THINKING || (cs == COACH_STREAMING && i == cnt - 1))) {
+                int dots = ((int)(GetTime() * 3.0)) % 4;
+                char think[6];
+                snprintf(think, sizeof(think), "%.*s", dots, "...");
+                Color placeholderC = (Color){ 210, 200, 175, 255 };
+                DrawTextEx(gFont, "Thinking", (Vector2){ txtR.x, txtR.y }, fontSize, 1, placeholderC);
+                DrawTextEx(gFont, think,
+                           (Vector2){ txtR.x + MeasureTextEx(gFont, "Thinking", fontSize, 1).x + 2, txtR.y },
+                           fontSize, 1, placeholderC);
+            } else {
+                DrawRichWrapped(snap[i].content, txtR, fontSize, lineSp, SB_TEXT);
+            }
+            y -= bubbleGap;
+        }
+
+        EndScissorMode();
+    }
+
+    /* ── input field ── */
+    const Color SB_INPUT_BG    = (Color){  28,  24,  20, 255 };
+    const Color SB_INPUT_BRD   = (Color){  95,  80,  62, 255 };
+    const Color SB_INPUT_HOV   = (Color){ 110, 180, 110, 255 };  // verde la hover
+    const Color SB_PLACEHOLDER = (Color){ 130, 115,  90, 255 };
+    const Color SB_CURSOR      = (Color){ 220, 230, 200, 255 };
+    const float inputFs = 18.0f;
+
+    bool inputHov = CheckCollisionPointRec(mouse, rInput);
+    DrawRectangleRounded(rInput, 0.2f, 6, SB_INPUT_BG);
+    DrawRectangleRoundedLines(rInput, 0.2f, 6, inputHov ? SB_INPUT_HOV : SB_INPUT_BRD);
+
+    // text + cursor
+    const char *displayed = coachInput[0] ? coachInput : NULL;
+    if (displayed) {
+        Vector2 tm = MeasureTextEx(gFont, coachInput, inputFs, 1);
+        float maxTextW = rInput.width - 20.0f;
+        const char *show = coachInput;
+        if (tm.x > maxTextW) {
+            int lo = 0, hi = coachInputLen;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                Vector2 m2 = MeasureTextEx(gFont, coachInput + mid, inputFs, 1);
+                if (m2.x <= maxTextW) hi = mid; else lo = mid + 1;
+            }
+            show = coachInput + lo;
+        }
+        DrawTextEx(gFont, show, (Vector2){ rInput.x + 10, rInput.y + 11 }, inputFs, 1, WHITE);
+        Vector2 cm = MeasureTextEx(gFont, show, inputFs, 1);
+        if ((int)((GetTime() - coachLastEditT) * 2.0) % 2 == 0) {
+            DrawRectangle((int)(rInput.x + 10 + cm.x + 1), (int)(rInput.y + 9),
+                          2, (int)(rInput.height - 18), SB_CURSOR);
+        }
+    } else {
+        DrawTextEx(gFont, "Ask the coach...",
+                   (Vector2){ rInput.x + 10, rInput.y + 11 }, inputFs, 1, SB_PLACEHOLDER);
+        if ((int)(GetTime() * 2.0) % 2 == 0) {
+            DrawRectangle((int)(rInput.x + 10), (int)(rInput.y + 9),
+                          2, (int)(rInput.height - 18), (Color){ 100, 110, 90, 255 });
+        }
+    }
+
+    /* input handling */
+    bool canSend = (coachInputLen > 0) && (cs == COACH_IDLE || cs == COACH_ERROR);
+
+    int ch = GetCharPressed();
+    while (ch > 0) {
+        if (ch >= 32 && ch < 127 && coachInputLen < COACH_INPUT_MAX - 1) {
+            coachInput[coachInputLen++] = (char)ch;
+            coachInput[coachInputLen]   = '\0';
+            coachLastEditT = GetTime();
+        }
+        ch = GetCharPressed();
+    }
+    if (coachInputLen > 0 && IsKeyPressed(KEY_BACKSPACE)) {
+        coachInput[--coachInputLen] = '\0';
+        coachLastEditT = GetTime();
+    }
+    if (canSend && IsKeyPressed(KEY_ENTER)) {
+        coach_dispatch_send(coachInput);
+        coachInputLen = 0;
+        coachInput[0] = '\0';
+        coachScroll   = 0;
+    }
+
+    /* Send button — paleta verde (C_BTN/C_BTN_HOV) */
+    bool sendHov = CheckCollisionPointRec(mouse, rSend);
+    Color sBg = !canSend ? (Color){55, 50, 45, 255}
+                         : (sendHov ? C_BTN_HOV : C_BTN);
+    Color sBd = !canSend ? (Color){80, 75, 65, 255}
+                         : (sendHov ? LIME : GREEN);
+    DrawRectangleRounded(rSend, 0.25f, 6, sBg);
+    DrawRectangleRoundedLines(rSend, 0.25f, 6, sBd);
+    Vector2 sv = MeasureTextEx(gFont, "Send", 18, 1);
+    DrawTextEx(gFont, "Send",
+               (Vector2){ rSend.x + (rSend.width - sv.x) * 0.5f,
+                          rSend.y + (rSend.height - sv.y) * 0.5f },
+               18, 1, canSend ? WHITE : (Color){ 140, 130, 115, 255 });
+    if (canSend && sendHov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        coach_dispatch_send(coachInput);
+        coachInputLen = 0;
+        coachInput[0] = '\0';
+        coachScroll   = 0;
+    }
+
+    // /* Hint quick-action button */
+    // bool hintHov = CheckCollisionPointRec(mouse, rHint);
+    // bool canHint = (cs == COACH_IDLE || cs == COACH_ERROR);
+    // Color hBg = !canHint ? (Color){45, 50, 60, 255}
+    //                      : (hintHov ? (Color){170, 130, 30, 255} : (Color){140, 105, 18, 255});
+    // Color hBd = !canHint ? (Color){80, 80, 90, 255}
+    //                      : (hintHov ? WHITE : GOLD);
+    // DrawRectangleRounded(rHint, 0.25f, 6, hBg);
+    // DrawRectangleRoundedLines(rHint, 0.25f, 6, hBd);
+    // Vector2 hv = MeasureTextEx(gFont, "Hint — explain a good move", 14, 1);
+    // DrawTextEx(gFont, "Hint — explain a good move",
+    //            (Vector2){ rHint.x + (rHint.width - hv.x) * 0.5f,
+    //                       rHint.y + (rHint.height - hv.y) * 0.5f },
+    //            14, 1, canHint ? (Color){25, 18, 0, 255} : GRAY);
+    // if (canHint && hintHov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+    //     coach_dispatch_send(
+    //         "Please give me a hint for the current position — what should I play, and why?");
+    //     coachScroll = 0;
+    // }
+}
+
 void DrawGame(void)
 {
     ClearBackground(C_BG);
@@ -2010,6 +2598,44 @@ void DrawGame(void)
 
     float px = (float)(PANEL_X + 5);
     float py = (float)(PANEL_Y + 18);
+
+    // ── AI Coach toggle (doar in joc vs bot pentru utilizatori Pro) ──
+    if (botMode && coach_is_premium()) {
+        Rectangle rCoach = { px - 5, (float)PANEL_Y + 6, (float)(PANEL_W - 10), 34.0f };
+        bool hov = CheckCollisionPointRec(mouse, rCoach);
+        // paleta verde — aliniata cu C_BTN / C_BTN_HOV
+        Color bg     = coachOpen ? (Color){  80, 145,  90, 255 }
+                                 : (hov ? C_BTN_HOV : C_BTN);
+        Color border = coachOpen ? (Color){ 200, 230, 180, 255 }
+                                 : (hov ? LIME : GREEN);
+        DrawRectangleRounded(rCoach, 0.3f, 8, bg);
+        DrawRectangleRoundedLines(rCoach, 0.3f, 8, border);
+
+        // un mic indicator de status la stanga (bulina)
+        Color dot;
+        switch (coach_status()) {
+            case COACH_THINKING:  dot = (Color){ 235, 195, 110, 255 }; break;
+            case COACH_STREAMING: dot = (Color){ 140, 220, 120, 255 }; break;
+            case COACH_ERROR:     dot = (Color){ 235, 110, 100, 255 }; break;
+            default:              dot = (Color){ 235, 230, 215, 255 }; break;
+        }
+        DrawCircle((int)(rCoach.x + 16), (int)(rCoach.y + rCoach.height * 0.5f), 6, dot);
+
+        const char *lbl = coachOpen ? "Hide AI Coach" : "AI Coach";
+        Vector2 lv = MeasureTextEx(gFont, lbl, 17, 1);
+        DrawTextEx(gFont, lbl,
+                   (Vector2){ rCoach.x + (rCoach.width - lv.x) * 0.5f + 8,
+                              rCoach.y + (rCoach.height - lv.y) * 0.5f },
+                   17, 1, WHITE);
+
+        if (hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            coach_set_open_state(!coachOpen);
+        }
+        py += 42.0f;  // impingem layout-ul standard mai jos cu inaltimea butonului
+    } else if (coachOpen) {
+        // contextul nu mai satisface conditiile de afisare — fortam inchiderea
+        coach_set_open_state(false);
+    }
 
     // ── ceasuri (afisate doar daca jocul are timer) ──
     if (gTimerEnabled) {
@@ -2288,6 +2914,11 @@ void DrawGame(void)
 
             if (hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
                 char promChar = (current_turn == 0) ? pKeys[i][0] : (char)tolower((unsigned char)pKeys[i][0]);
+                {
+                    char uci[8];
+                    coords_to_uci(promSrcRow, promSrcCol, promDstRow, promDstCol, pKeys[i][0], uci);
+                    snprintf(gLastMoveUci, sizeof(gLastMoveUci), "%s", uci);
+                }
                 execute_move(promSrcRow, promSrcCol, promDstRow, promDstCol, promChar);
 
                 // trimite mutarea prin retea daca suntem in modul multiplayer
@@ -2474,6 +3105,11 @@ void DrawGame(void)
                     } else {
                         // salvam coordonatele inainte de a deselecta (pentru trimiterea prin retea)
                         int srcR = selRow, srcC = selCol;
+                        {
+                            char uci[8];
+                            coords_to_uci(srcR, srcC, cr, cc, 0, uci);
+                            snprintf(gLastMoveUci, sizeof(gLastMoveUci), "%s", uci);
+                        }
 
                         // mutare normala
                         execute_move(selRow, selCol, cr, cc, 'Q');  // 'Q' e transmis ca placeholder ignorat
@@ -2519,6 +3155,9 @@ void DrawGame(void)
             }
         }
     }
+
+    // sidebar AI Coach (desenat ultimul, ca un overlay la dreapta ferestrei)
+    DrawCoachSidebar();
 }
 
 static bool gFontLoaded = false;
