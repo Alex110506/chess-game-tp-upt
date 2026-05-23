@@ -2294,12 +2294,15 @@ static void DrawCoachSidebar(void)
                                 : (msgArea.x + 4.0f);
             Rectangle bub = { bubX, y, bubW, bubbleH[i] };
             Color bubBg = isUser ? SB_USER_BG : SB_COACH_BG;
-            DrawRectangleRounded(bub, 0.18f, 8, bubBg);
+            float minSide = (bub.width < bub.height) ? bub.width : bub.height;
+            float roundness = 16.0f / minSide; // 8px radius absolute
+            if (roundness > 1.0f) roundness = 1.0f;
+            DrawRectangleRounded(bub, roundness, 8, bubBg);
 
             // marker mic (cine vorbeste)
             const char *who = isUser ? "You" : "Coach";
             Color whoCol  = isUser ? SB_USER_WHO : SB_COACH_WHO;
-            DrawTextEx(gFont, who, (Vector2){ bub.x + innerPad, bub.y + 5 }, 11, 2, whoCol);
+            DrawTextEx(gFont, who, (Vector2){ bub.x + innerPad, bub.y + 5 }, 14, 2, whoCol);
 
             // continut
             Rectangle txtR = { bub.x + innerPad,
@@ -2507,6 +2510,7 @@ void DrawGame(void)
     /* ── coach: polling pentru bestmove ── */
     if (g_coach_waiting_engine && sf_poll_move()) {
         g_coach_waiting_engine = false;
+        
         char fen[160];
         board_to_fen(fen, (int)sizeof(fen));
         const char *side  = (current_turn == 0) ? "white" : "black";
