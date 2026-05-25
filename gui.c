@@ -38,6 +38,8 @@ int main(void)
             DrawMpSetup();
         else if (curScreen == SCR_MPLOBBY)
             DrawMpLobby();
+        else if (curScreen == SCR_MPMATCHMAKING)
+            DrawMpMatchmaking();
         else if (curScreen == SCR_PUZZLESETUP)
             DrawPuzzleSetup();
         else if (curScreen == SCR_LOGIN)

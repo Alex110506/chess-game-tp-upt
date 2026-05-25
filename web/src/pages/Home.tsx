@@ -18,25 +18,30 @@ export function Home() {
     <div className="animate-fade-in">
 
       {/* Hero */}
-      <section style={{ padding: '7rem 0 5rem', textAlign: 'center' }}>
-        <div className="container">
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', padding: '0.35rem 1.1rem', background: 'rgba(46,105,56,0.18)', border: '1px solid var(--primary)', borderRadius: '999px', marginBottom: '2rem', color: 'var(--primary-light)', fontSize: '0.9rem' }}>
-            <Zap size={14} />
-            AI Coach Pro — now available
-          </div>
-          <h1 style={{ fontSize: 'clamp(2.5rem, 6vw, 4.5rem)', lineHeight: 1.1, marginBottom: '1.5rem', maxWidth: '820px', margin: '0 auto 1.5rem' }}>
-            Play, Compete &amp; Improve with <span className="text-gradient">Precision</span>
-          </h1>
-          <p style={{ fontSize: '1.2rem', color: 'var(--text-muted)', maxWidth: '580px', margin: '0 auto 2.5rem', lineHeight: 1.7 }}>
-            Ranked online chess with ELO, Stockfish-powered bot and hints, handcrafted puzzles, chess clock, and a personal AI coach — all in one place.
-          </p>
-          <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', flexWrap: 'wrap' }}>
-            <Link to="/register" className="btn btn-primary" style={{ padding: '0.9rem 2rem', fontSize: '1.1rem' }}>
-              <Globe size={20} /> Play Ranked
-            </Link>
-            <a href="#features" className="btn btn-outline" style={{ padding: '0.9rem 2rem', fontSize: '1.1rem' }}>
-              Explore Features
-            </a>
+      <section style={{ position: 'relative', padding: '9rem 0 7rem', textAlign: 'center' }}>
+        <div className="container" style={{ position: 'relative', zIndex: 2 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', maxWidth: '900px', margin: '0 auto' }}>
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', padding: '0.4rem 1.25rem', background: 'rgba(255,255,255,0.05)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '999px', marginBottom: '2rem', color: 'var(--primary-light)', fontSize: '0.9rem', fontWeight: 600, boxShadow: '0 8px 32px rgba(0,0,0,0.3)' }}>
+              <Zap size={14} className="animate-pulse" />
+              AI Coach Pro — now available
+            </div>
+            
+            <h1 style={{ fontSize: 'clamp(3.5rem, 7vw, 5.5rem)', lineHeight: 1.05, marginBottom: '1.5rem', fontWeight: 800, textShadow: '0 10px 30px rgba(0,0,0,0.8)' }}>
+              Play, Compete &amp; Improve with <span className="text-gradient">Precision</span>
+            </h1>
+            
+            <p style={{ fontSize: '1.35rem', color: 'rgba(255,255,255,0.8)', marginBottom: '3rem', lineHeight: 1.6, maxWidth: '680px', textShadow: '0 4px 12px rgba(0,0,0,0.5)' }}>
+              Ranked online chess with ELO, Stockfish-powered bot and hints, handcrafted puzzles, chess clock, and a personal AI coach — all in one place.
+            </p>
+            
+            <div style={{ display: 'flex', gap: '1.25rem', flexWrap: 'wrap', justifyContent: 'center' }}>
+              <Link to="/register" className="btn btn-primary" style={{ padding: '1.1rem 2.5rem', fontSize: '1.2rem', boxShadow: '0 10px 30px -5px rgba(46,105,56,0.6)', backdropFilter: 'blur(5px)' }}>
+                <Globe size={22} /> Play Ranked
+              </Link>
+              <a href="#features" className="btn btn-outline" style={{ padding: '1.1rem 2.5rem', fontSize: '1.2rem', background: 'rgba(255,255,255,0.03)', backdropFilter: 'blur(10px)', border: '1px solid rgba(255,255,255,0.1)', color: 'white' }}>
+                Explore Features
+              </a>
+            </div>
           </div>
         </div>
       </section>

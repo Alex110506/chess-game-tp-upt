@@ -460,6 +460,14 @@ class Room:
 rooms: dict[str, Room] = {}
 rooms_lock = asyncio.Lock()
 
+@dataclass
+class QueueEntry:
+    ws: WebSocket
+    username: Optional[str]
+    rank: int
+
+matchmaking_queue: list[QueueEntry] = []
+
 
 def _new_code() -> str:
     alphabet = string.ascii_uppercase + string.digits
@@ -488,6 +496,12 @@ async def _drop_room(code: str) -> None:
     async with rooms_lock:
         rooms.pop(code, None)
 
+
+def _find_my_room(ws: WebSocket) -> Optional[Room]:
+    for r in rooms.values():
+        if r.host == ws or r.guest == ws:
+            return r
+    return None
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
@@ -554,6 +568,8 @@ async def ws_endpoint(ws: WebSocket):
 
             elif mtype in ("move", "resign"):
                 if my_room is None:
+                    my_room = _find_my_room(ws)
+                if my_room is None:
                     await _send(ws, {"type": "error", "msg": "not in room"})
                     continue
                 peer = await _peer(my_room, ws)
@@ -561,6 +577,52 @@ async def ws_endpoint(ws: WebSocket):
                     await _send(ws, {"type": "error", "msg": "no opponent yet"})
                     continue
                 await _send(peer, msg)
+
+            elif mtype == "queue":
+                if my_room is not None:
+                    await _send(ws, {"type": "error", "msg": "already in room"})
+                    continue
+                username = msg.get("username")
+                rank = DEFAULT_RANK
+                if username:
+                    doc = await _users().find_one({"username": username})
+                    if doc:
+                        rank = doc.get("rank", DEFAULT_RANK)
+                
+                async with rooms_lock:
+                    # Remove if already in queue
+                    matchmaking_queue[:] = [e for e in matchmaking_queue if e.ws != ws]
+                    
+                    # Try to find a match
+                    matched_entry = None
+                    for i, entry in enumerate(matchmaking_queue):
+                        if abs(entry.rank - rank) <= 100 and entry.username != username:
+                            matched_entry = entry
+                            matchmaking_queue.pop(i)
+                            break
+                    
+                    if matched_entry:
+                        # Match found! Create a room
+                        code = _new_code()
+                        room = Room(code=code, host=matched_entry.ws, host_user=matched_entry.username, time_seconds=300)
+                        room.guest = ws
+                        room.guest_user = username
+                        rooms[code] = room
+                        my_room = room
+                        
+                        # Notify Player 1 (who was waiting in queue, now host)
+                        await _send(matched_entry.ws, {"type": "created", "code": code, "color": "white", "time": 300})
+                        await _send(matched_entry.ws, {"type": "start", "opponent": username or "", "time": 300})
+                        
+                        # Notify Player 2 (who just joined queue, now guest)
+                        await _send(ws, {"type": "joined", "code": code, "color": "black", "opponent": matched_entry.username or "", "time": 300})
+                        await _send(ws, {"type": "start", "opponent": matched_entry.username or "", "time": 300})
+                    else:
+                        matchmaking_queue.append(QueueEntry(ws=ws, username=username, rank=rank))
+            
+            elif mtype == "dequeue":
+                async with rooms_lock:
+                    matchmaking_queue[:] = [e for e in matchmaking_queue if e.ws != ws]
 
             else:
                 await _send(ws, {"type": "error", "msg": f"unknown type: {mtype}"})
@@ -570,6 +632,10 @@ async def ws_endpoint(ws: WebSocket):
     except Exception:
         pass
     finally:
+        async with rooms_lock:
+            matchmaking_queue[:] = [e for e in matchmaking_queue if e.ws != ws]
+        if my_room is None:
+            my_room = _find_my_room(ws)
         if my_room is not None:
             peer = await _peer(my_room, ws)
             if peer is not None:

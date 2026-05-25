@@ -45,6 +45,8 @@ void net_send_create(const char *username, int time_seconds);
 void net_send_join(const char *code, const char *username);
 void net_send_move(const char *uci);
 void net_send_resign(void);
+void net_send_queue(const char *username);
+void net_send_dequeue(void);
 
 // citeste un mesaj din coada (neblocant). returneaza 1 daca s-a obtinut mesaj
 int net_poll(NetMsg *out);

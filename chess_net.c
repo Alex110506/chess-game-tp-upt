@@ -177,6 +177,23 @@ void net_send_resign(void)
     send_line("{\"type\":\"resign\"}\n");
 }
 
+void net_send_queue(const char *username)
+{
+    char ubuf[24] = {0};
+    sanitize_username(username, ubuf, sizeof(ubuf));
+    char buf[128];
+    if (ubuf[0])
+        snprintf(buf, sizeof(buf), "{\"type\":\"queue\",\"username\":\"%s\"}\n", ubuf);
+    else
+        snprintf(buf, sizeof(buf), "{\"type\":\"queue\"}\n");
+    send_line(buf);
+}
+
+void net_send_dequeue(void)
+{
+    send_line("{\"type\":\"dequeue\"}\n");
+}
+
 // extrage valoarea unui camp string ("key":"...") din 'src' in 'dst' (max dst_sz-1)
 // returneaza 1 daca a fost gasit
 static int json_get_str(const char *src, const char *key, char *dst, int dst_sz)

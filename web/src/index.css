@@ -36,7 +36,10 @@
 body {
   font-family: var(--font-family);
   background-color: var(--bg-color);
-  background-image: var(--bg-gradient);
+  background-image: radial-gradient(circle at center, rgba(18, 18, 18, 0.7) 0%, rgba(18, 18, 18, 0.95) 100%), url('/src/assets/free-photo-of-close-up-of-chess-pieces.jpeg');
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
   color: var(--text-main);
   min-height: 100vh;
   overflow-x: hidden;
@@ -205,6 +208,22 @@ a:hover {
 
 .animate-fade-in {
   animation: fadeIn 0.6s ease-out forwards;
+}
+
+@keyframes float {
+  0% { transform: translateY(0px); }
+  50% { transform: translateY(-15px); }
+  100% { transform: translateY(0px); }
+}
+
+@keyframes pulseGlow {
+  0% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.1); opacity: 0.7; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+.animate-pulse {
+  animation: pulseGlow 2s infinite;
 }
 
 .delay-100 { animation-delay: 100ms; opacity: 0; }

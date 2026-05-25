@@ -604,6 +604,7 @@ static const int gPuzzleCount = (int)(sizeof(gPuzzles) / sizeof(gPuzzles[0]));
 static int  mpMode = 0;            // 1 = joc online prin server
 static int  mpMyColor = 0;         // 0 = alb, 1 = negru (coloarea pe care o jucam)
 static char mpRoomCode[8] = "";    // codul camerei curente (afisat pe ecran)
+static double mpQueueStartTime = 0.0; // inceputul asteptarii in queue
 static char mpJoinInput[8] = "";   // bufferul de input pentru codul de join
 static char mpStatus[160] = "";    // mesaj informativ afisat in UI (erori, info)
 static bool mpHosting = false;     // 1 daca tocmai am cerut create si asteptam codul
@@ -1517,8 +1518,24 @@ void DrawMpSetup(void)
 
     float bw = 380.0f, bh = 58.0f, bx = (WIN_W - bw) * 0.5f;
 
+    // FIND A GAME (Matchmaking)
+    Rectangle bFind = { bx, 180, bw, bh };
+    if (Btn(bFind, "Find a Game (5 min)", false)) {
+        if (!net_running()) {
+            if (!net_start(NULL)) {
+                snprintf(mpStatus, sizeof(mpStatus), "Could not start network bridge");
+            }
+        }
+        if (net_running()) {
+            net_send_queue(gAuth.logged_in ? gAuth.username : NULL);
+            mpQueueStartTime = GetTime();
+            mpStatus[0] = '\0';
+            curScreen = SCR_MPMATCHMAKING;
+        }
+    }
+
     // HOST
-    Rectangle bHost = { bx, 200, bw, bh };
+    Rectangle bHost = { bx, 255, bw, bh };
     bool hosting = mpHosting;  // dezactivat in timp ce asteptam codul
     if (Btn(bHost, hosting ? "Connecting..." : "Host New Game", hosting)) {
         // gazda alege ceasul inainte de a deschide camera
@@ -1529,10 +1546,10 @@ void DrawMpSetup(void)
     // sectiunea JOIN
     const char *jHdr = "Join an existing room:";
     Vector2 jhv = MeasureTextEx(gFont, jHdr, 20, 1);
-    DrawTextEx(gFont, jHdr, (Vector2){ (WIN_W - jhv.x) * 0.5f, 290.0f }, 20, 1, LIGHTGRAY);
+    DrawTextEx(gFont, jHdr, (Vector2){ (WIN_W - jhv.x) * 0.5f, 330.0f }, 20, 1, LIGHTGRAY);
 
     // input pentru codul camerei (4 caractere)
-    Rectangle inputR = { bx, 320, bw, bh };
+    Rectangle inputR = { bx, 355, bw, bh };
     bool inputHov = CheckCollisionPointRec(mouse, inputR);
     DrawRectangleRounded(inputR, 0.18f, 8, (Color){ 35, 35, 35, 255 });
     DrawRectangleRoundedLines(inputR, 0.18f, 8, inputHov ? LIME : DARKGRAY);
@@ -1564,7 +1581,7 @@ void DrawMpSetup(void)
 
     // butonul Join (activ doar cand avem 4 caractere)
     bool joinReady = (strlen(mpJoinInput) == 4);
-    Rectangle bJoin = { bx, 395, bw, bh };
+    Rectangle bJoin = { bx, 430, bw, bh };
     if (Btn(bJoin, "Join Room", !joinReady)) {
         if (!net_running()) {
             if (!net_start(NULL)) {
@@ -1641,6 +1658,53 @@ void DrawMpLobby(void)
     if (Btn(bCancel, "Cancel", false)) {
         mp_cleanup();
         curScreen = SCR_HOME;
+    }
+}
+
+// ecranul de asteptare in queue
+void DrawMpMatchmaking(void)
+{
+    draw_menu_bg();
+
+    const char *title = "MATCHMAKING";
+    int titleSize = 56;
+    Vector2 tv = MeasureTextEx(gFont, title, titleSize, 2);
+    DrawTextEx(gFont, title, (Vector2){ (WIN_W - tv.x) * 0.5f, 100.0f }, titleSize, 2, WHITE);
+
+    const char *sub = "Searching for an opponent of similar rank (+-100 ELO)...";
+    Vector2 sv = MeasureTextEx(gFont, sub, 20, 1);
+    DrawTextEx(gFont, sub, (Vector2){ (WIN_W - sv.x) * 0.5f, 180.0f }, 20, 1, LIGHTGRAY);
+
+    // afiseaza timer
+    int elapsed = (int)(GetTime() - mpQueueStartTime);
+    int m = elapsed / 60;
+    int s = elapsed % 60;
+    char timeTxt[64];
+    snprintf(timeTxt, sizeof(timeTxt), "Time in queue: %02d:%02d", m, s);
+    Vector2 tvTime = MeasureTextEx(gFont, timeTxt, 36, 2);
+    DrawTextEx(gFont, timeTxt, (Vector2){ (WIN_W - tvTime.x) * 0.5f, 260.0f }, 36, 2, GOLD);
+
+    // animatie
+    int dots = ((int)(GetTime() * 3.0)) % 4;
+    char waitTxt[32];
+    snprintf(waitTxt, sizeof(waitTxt), "Searching%.*s", dots, "...");
+    Vector2 wv = MeasureTextEx(gFont, waitTxt, 24, 1);
+    DrawTextEx(gFont, waitTxt, (Vector2){ (WIN_W - wv.x) * 0.5f, 340.0f }, 24, 1, LIGHTGRAY);
+
+    mp_drain_menu_messages();
+
+    if (mpStatus[0] != '\0') {
+        Vector2 mv = MeasureTextEx(gFont, mpStatus, 18, 1);
+        DrawTextEx(gFont, mpStatus, (Vector2){ (WIN_W - mv.x) * 0.5f, 400.0f }, 18, 1, RED);
+    }
+
+    float bw = 380.0f, bh = 58.0f, bx = (WIN_W - bw) * 0.5f;
+    Rectangle bCancel = { bx, 480, bw, bh };
+    if (Btn(bCancel, "Cancel", false)) {
+        if (net_running()) {
+            net_send_dequeue();
+        }
+        curScreen = SCR_MPSETUP;
     }
 }
 

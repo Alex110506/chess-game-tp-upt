@@ -14,6 +14,7 @@ typedef enum {
     SCR_BOTSETUP,
     SCR_MPSETUP,    // alegerea intre host si join pentru multiplayer
     SCR_MPLOBBY,    // gazda asteapta un oponent (afiseaza codul camerei)
+    SCR_MPMATCHMAKING, // player-ul asteapta un meci bazat pe ELO
     SCR_PUZZLESETUP, // alegerea unui puzzle "checkmate in N"
     SCR_LOGIN,      // ecran de autentificare/inregistrare
     SCR_PROFILE,    // profilul jucatorului (stats si rank)
@@ -33,6 +34,7 @@ void DrawHome(void);
 void DrawBotSetup(void);
 void DrawMpSetup(void);
 void DrawMpLobby(void);
+void DrawMpMatchmaking(void);
 void DrawPuzzleSetup(void);
 void DrawLogin(void);
 void DrawProfile(void);
